@@ -1,6 +1,8 @@
 import mongoose from "mongoose";
 
 export type UserDoc = mongoose.Document & {
+  firstName: string;
+  lastName: string;
   email: string;
   password: string;
   plan: "free" | "pro";
@@ -8,6 +10,8 @@ export type UserDoc = mongoose.Document & {
 
 const userSchema = new mongoose.Schema<UserDoc>(
   {
+    firstName: { type: String, required: true, trim: true },
+    lastName: { type: String, required: true, trim: true },
     email: { type: String, required: true, unique: true, index: true },
     password: { type: String, required: true },
     plan: { type: String, enum: ["free", "pro"], default: "free" },

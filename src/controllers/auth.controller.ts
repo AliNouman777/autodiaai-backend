@@ -42,29 +42,49 @@ function clearAuthCookies(res: Response) {
 }
 
 export async function register(req: Request, res: Response) {
-  const { email, password } = req.body as { email: string; password: string };
+  const { firstName, lastName, email, password } = req.body as {
+    firstName: string;
+    lastName: string;
+    email: string;
+    password: string;
+  };
+
   const exists = await User.findOne({ email });
-  if (exists) return res.status(409).json(fail("Email already registered", "EMAIL_TAKEN"));
+  if (exists) {
+    return res.status(409).json(fail("Email already registered", "EMAIL_TAKEN"));
+  }
 
   const hashed = await bcrypt.hash(password, 10);
-  const user = await User.create({ email, password: hashed, plan: "free" });
+  const user = await User.create({
+    firstName,
+    lastName,
+    email,
+    password: hashed,
+    plan: "free",
+  });
 
   const access = signJwt(
     { id: user.id, email: user.email, plan: user.plan },
     process.env.JWT_ACCESS_SECRET || "access",
     { expiresIn: asExpires(process.env.JWT_ACCESS_EXPIRES, "15m") },
   );
+
   const refresh = signJwt({ id: user.id }, process.env.JWT_REFRESH_SECRET || "refresh", {
     expiresIn: asExpires(process.env.JWT_REFRESH_EXPIRES, "7d"),
   });
 
   setAuthCookies(res, access, refresh);
 
-  // If you want cookie-only auth, you can remove tokens from the JSON.
   return res.status(201).json(
     ok({
-      user: { id: user.id, email: user.email, plan: user.plan },
-      tokens: { access, refresh }, // ← optional to return (refresh in JSON is less safe)
+      user: {
+        id: user.id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        plan: user.plan,
+      },
+      tokens: { access, refresh }, // optional to return refresh
     }),
   );
 }
@@ -106,7 +126,7 @@ export async function me(req: Request, res: Response) {
     process.env.JWT_ACCESS_SECRET || "access",
     { expiresIn: asExpires(process.env.JWT_ACCESS_EXPIRES, "15m") },
   );
-  
+
   setAuthCookies(res, newAccess);
   return res.json(ok({ user: req.user }));
 }

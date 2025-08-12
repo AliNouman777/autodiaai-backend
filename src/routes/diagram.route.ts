@@ -10,7 +10,6 @@ import {
 } from "../controllers/diagram.controller";
 
 const router = Router();
-router.use(requireAuth);
 
 router.get("/diagrams", listMyDiagrams);
 router.get("/diagrams/:id", getDiagram);
