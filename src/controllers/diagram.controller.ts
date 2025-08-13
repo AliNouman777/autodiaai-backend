@@ -1,15 +1,86 @@
 import type { Request, Response } from "express";
 import Diagram from "../models/diagram.model";
 import { ok, fail } from "../utils/http";
-import { GenerateDiagramReq, DiagramPayload, UpdateDiagramReq } from "../schemas/diagram.schema";
-import { getProvider, validateDiagram, SYSTEM_PROMPT } from "../services/ai";
+import { CreateDiagramReq, UpdateDiagramReq } from "../schemas/diagram.schema";
+import { getProvider } from "../services/ai";
 import aicacheModel from "../models/aicache.model";
 import * as nodeCrypto from "node:crypto";
 
+// ---------- helpers ----------
+function ensureDiagramShape(obj: any) {
+  if (!obj || typeof obj !== "object") throw new Error("Bad AI output");
+  if (!Array.isArray(obj.nodes) || !Array.isArray(obj.edges)) {
+    throw new Error("AI must return { nodes: [], edges: [] }");
+  }
+  const title =
+    typeof obj.title === "string" && obj.title.trim().length
+      ? obj.title.trim()
+      : "Untitled Diagram";
+  return { title, nodes: obj.nodes, edges: obj.edges };
+}
+
+function makeKey(model: string, prompt: string) {
+  const norm = prompt.trim().replace(/\s+/g, " ");
+  return `${model}::` + nodeCrypto.createHash("sha256").update(norm).digest("hex");
+}
+
+async function generateFromPrompt({
+  prompt,
+  model,
+  titleOverride,
+}: {
+  prompt: string;
+  model: "gpt5" | "gemini";
+  titleOverride?: string;
+}) {
+  const key = makeKey(model, prompt);
+
+  // 1) Try cache
+  const hit = await aicacheModel.findOne({ key }).lean();
+  if (hit) {
+    const diagram = ensureDiagramShape(hit.payload);
+    if (titleOverride) diagram.title = titleOverride;
+    return { ...diagram, prompt, model };
+  }
+
+  // 2) Call provider
+  const provider = getProvider(model);
+  const raw = await provider.generate(prompt);
+  const rawText = typeof raw === "string" ? raw : JSON.stringify(raw);
+
+  // 3) Parse JSON (tolerant)
+  let parsed: any;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    const s = rawText.indexOf("{");
+    const e = rawText.lastIndexOf("}");
+    if (s >= 0 && e > s) parsed = JSON.parse(rawText.slice(s, e + 1));
+    else throw new Error("AI did not return JSON");
+  }
+  const diagram = ensureDiagramShape(parsed);
+  if (titleOverride) diagram.title = titleOverride;
+
+  // 4) Save cache
+  await aicacheModel.create({ key, raw: rawText, payload: diagram });
+
+  return { ...diagram, prompt, model };
+}
+
+// ---------- CRUD ----------
+
 // GET /api/diagrams
 export async function listMyDiagrams(req: Request, res: Response) {
-  const items = await Diagram.find({ userId: req.user!.id }).sort({ createdAt: -1 }).lean();
-  res.json(ok({ items }));
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = Math.min(100, Number(req.query.limit) || 20);
+  const skip = (page - 1) * limit;
+
+  const [items, total] = await Promise.all([
+    Diagram.find({ userId: req.user!.id }).sort({ updatedAt: -1 }).skip(skip).limit(limit).lean(),
+    Diagram.countDocuments({ userId: req.user!.id }),
+  ]);
+
+  return res.json(ok({ items, page, limit, total, pages: Math.ceil(total / limit) }));
 }
 
 // GET /api/diagrams/:id
@@ -26,131 +97,88 @@ export async function deleteDiagram(req: Request, res: Response) {
   res.json(ok({}));
 }
 
-// POST /api/diagrams  (save client-provided JSON)
+// POST /api/diagrams  (create by metadata only: name + type)
 export async function createDiagram(req: Request, res: Response) {
-  const parsed = DiagramPayload.safeParse(req.body);
-  if (!parsed.success)
+  const parsed = CreateDiagramReq.safeParse({ body: req.body });
+  if (!parsed.success) {
     return res.status(400).json(fail("Invalid diagram payload", "VALIDATION_ERROR"));
-  const { title, nodes, edges } = parsed.data;
+  }
+
+  const { name, type } = parsed.data.body;
+
   const doc = await Diagram.create({
     userId: req.user!.id,
-    title: title || "Untitled Diagram",
+    title: name.trim(),
+    type, // ✅ no enum; validated slug in zod
     prompt: "(manual)",
     model: "gpt5",
-    nodes,
-    edges,
+    nodes: [],
+    edges: [],
   });
-  res.status(201).json(ok(doc));
+
+  return res.status(201).json(ok(doc));
 }
 
-// PATCH /api/diagrams/:id (partial)
+// PATCH /api/diagrams/:id
+// - update metadata: name/type/title
+// - update content: nodes/edges
+// - OR generate via AI when body contains { prompt, model? }
 export async function updateDiagram(req: Request, res: Response) {
-  const parsed = UpdateDiagramReq.safeParse({ body: req.body });
-  if (!parsed.success) return res.status(400).json(fail("Invalid update", "VALIDATION_ERROR"));
-  const update: any = {};
-  if (req.body.title) update.title = req.body.title;
-  if (req.body.nodes) update.nodes = req.body.nodes;
-  if (req.body.edges) update.edges = req.body.edges;
-
-  const doc = await Diagram.findOneAndUpdate(
-    { _id: req.params.id, userId: req.user!.id },
-    { $set: update },
-    { new: true },
-  ).lean();
-  if (!doc) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
-  res.json(ok(doc));
-}
-
-// POST /api/diagrams/generate
-
-/** very small guard so we don't save junk */
-function ensureDiagramShape(obj: any) {
-  if (!obj || typeof obj !== "object") throw new Error("Bad AI output");
-  if (!Array.isArray(obj.nodes) || !Array.isArray(obj.edges)) {
-    throw new Error("AI must return { nodes: [], edges: [] }");
+  const parsed = UpdateDiagramReq.safeParse({ params: req.params, body: req.body });
+  if (!parsed.success) {
+    return res.status(400).json(fail("Invalid update", "VALIDATION_ERROR"));
   }
-  const title =
-    typeof obj.title === "string" && obj.title.trim().length
-      ? obj.title.trim()
-      : "Untitled Diagram";
-  return { title, nodes: obj.nodes, edges: obj.edges };
-}
 
-function makeKey(model: string, prompt: string) {
-  const normPrompt = prompt.trim().replace(/\s+/g, " ");
-  return `${model}::` + nodeCrypto.createHash("sha256").update(normPrompt).digest("hex");
-}
+  const { id } = parsed.data.params;
+  const { name, title, type, nodes, edges, prompt, model } = parsed.data.body as {
+    name?: string;
+    title?: string; // legacy
+    type?: string;
+    nodes?: any[];
+    edges?: any[];
+    prompt?: string;
+    model?: "gpt5" | "gemini";
+  };
 
-/**
- * POST /api/diagrams/generate
- * body: { prompt: string; model: "gpt5"|"gemini"; title?: string }
- */
-export async function generateDiagram(req: Request, res: Response) {
-  // super minimal validation
-  const prompt = String(req.body?.prompt || "").trim();
-  const model = (req.body?.model as "gpt5" | "gemini") || "gpt5";
-  const titleOverride = typeof req.body?.title === "string" ? req.body.title.trim() : "";
+  // Ensure the diagram exists & belongs to the user
+  const existing = await Diagram.findOne({ _id: id, userId: req.user!.id });
+  if (!existing) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
 
-  if (!prompt) return res.status(400).json(fail("prompt is required", "VALIDATION_ERROR"));
-  if (!["gpt5", "gemini"].includes(model))
-    return res.status(400).json(fail("invalid model", "VALIDATION_ERROR"));
+  const $set: Record<string, any> = {};
 
-  const key = makeKey(model, prompt);
+  // metadata
+  if (name) $set.title = name.trim();
+  else if (title) $set.title = title.trim(); // backward compatible
+  if (typeof type === "string") $set.type = type;
 
-  try {
-    // 1) try cache (global cache across users)
-    const hit = await aicacheModel.findOne({ key }).lean();
-    if (hit) {
-      const diagram = ensureDiagramShape(hit.payload);
-      if (titleOverride) diagram.title = titleOverride;
+  // content updates (manual)
+  if (Array.isArray(nodes)) $set.nodes = nodes;
+  if (Array.isArray(edges)) $set.edges = edges;
 
-      const doc = await Diagram.create({
-        userId: req.user!.id,
-        title: diagram.title,
-        prompt,
-        model,
-        nodes: diagram.nodes,
-        edges: diagram.edges,
+  // AI generation path (merged into update)
+  if (prompt && prompt.trim()) {
+    const chosenModel = model || "gpt5";
+
+    try {
+      const generated = await generateFromPrompt({
+        prompt: prompt.trim(),
+        model: chosenModel,
+        titleOverride: $set.title, // use requested name if present
       });
 
-      return res.status(201).json(ok(doc));
+      $set.nodes = generated.nodes;
+      $set.edges = generated.edges;
+      $set.prompt = generated.prompt;
+      $set.model = generated.model;
+
+      // if no title was provided in this request, use generated title
+      if (!$set.title) $set.title = generated.title;
+    } catch (err: any) {
+      return res.status(502).json(fail(err?.message || "AI failed", "AI_FAILED"));
     }
-
-    // 2) call provider (OpenAI/Gemini)
-    const provider = getProvider(model);
-    const raw = await provider.generate(prompt);
-
-    const rawText = typeof raw === "string" ? raw : JSON.stringify(raw);
-
-    // 3) parse → shape guard (kept tiny & forgiving)
-    let parsed: any;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch {
-      // fallback: try to extract {...} if model wrapped in prose/fences
-      const start = rawText.indexOf("{");
-      const end = rawText.lastIndexOf("}");
-      if (start >= 0 && end > start) parsed = JSON.parse(rawText.slice(start, end + 1));
-      else throw new Error("AI did not return JSON");
-    }
-    const diagram = ensureDiagramShape(parsed);
-    if (titleOverride) diagram.title = titleOverride;
-
-    // 4) save to cache (so next same prompt/model skips LLM)
-    await aicacheModel.create({ key, raw: rawText, payload: diagram });
-
-    // 5) save user doc
-    const doc = await Diagram.create({
-      userId: req.user!.id,
-      title: diagram.title,
-      prompt,
-      model,
-      nodes: diagram.nodes,
-      edges: diagram.edges,
-    });
-
-    return res.status(201).json(ok(doc));
-  } catch (err: any) {
-    return res.status(502).json(fail(err?.message || "AI failed", "AI_FAILED"));
   }
+
+  const doc = await Diagram.findByIdAndUpdate(existing._id, { $set }, { new: true }).lean();
+
+  return res.json(ok(doc));
 }

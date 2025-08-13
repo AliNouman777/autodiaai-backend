@@ -3,7 +3,6 @@ import { requireAuth } from "../middlewares/auth";
 import {
   createDiagram,
   deleteDiagram,
-  generateDiagram,
   getDiagram,
   listMyDiagrams,
   updateDiagram,
@@ -11,11 +10,10 @@ import {
 
 const router = Router();
 
-router.get("/diagrams", listMyDiagrams);
-router.get("/diagrams/:id", getDiagram);
-router.post("/diagrams", createDiagram);
-router.post("/diagrams/generate", generateDiagram);
-router.patch("/diagrams/:id", updateDiagram);
-router.delete("/diagrams/:id", deleteDiagram);
+router.get("/diagrams", requireAuth, listMyDiagrams);
+router.get("/diagrams/:id", requireAuth, getDiagram);
+router.post("/diagrams", requireAuth, createDiagram);
+router.patch("/diagrams/:id", requireAuth, updateDiagram);
+router.delete("/diagrams/:id", requireAuth, deleteDiagram);
 
 export default router;
