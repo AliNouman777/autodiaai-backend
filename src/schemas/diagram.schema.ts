@@ -35,6 +35,8 @@ export const DiagramNode = z.object({
   }),
 });
 
+const ModelEnum = z.enum(["gpt-5", "gpt-5-mini", "gemini-2.5-flash", "gemini-2.5-flash-lite"]);
+
 /** Graph edge */
 export const DiagramEdge = z.object({
   id: z.string(),
@@ -70,17 +72,10 @@ export const typeSlug = z
 /** Create by metadata only (name + type) */
 export const CreateDiagramReq = z.object({
   body: z.object({
-    name: z.string().trim().min(1, "Name is required").max(120),
-    type: typeSlug,
-  }),
-});
-
-/** Generate via LLM (unchanged) */
-export const GenerateDiagramReq = z.object({
-  body: z.object({
-    prompt: z.string().min(5).max(2000),
-    model: z.enum(["gpt5", "gemini"]).default("gpt5"),
-    title: z.string().optional(),
+    name: z.string().min(1),
+    type: z.string().min(1),
+    // Optional: allow create to set a default model if you want
+    model: ModelEnum.optional(),
   }),
 });
 
@@ -104,7 +99,7 @@ export const UpdateDiagramReq = z.object({
       nodes: z.array(DiagramNode).optional(),
       edges: z.array(DiagramEdge).optional(),
       prompt: z.string().trim().min(5).max(2000).optional(),
-      model: z.enum(["gpt5", "gemini"]).optional(),
+      model: ModelEnum.optional(),
     })
     .refine(
       (b) => !!b.name || !!b.type || !!b.title || !!b.nodes || !!b.edges || !!b.prompt, // allow pure generation updates

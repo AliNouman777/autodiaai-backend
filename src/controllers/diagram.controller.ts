@@ -2,7 +2,7 @@ import type { Request, Response } from "express";
 import Diagram from "../models/diagram.model";
 import { ok, fail } from "../utils/http";
 import { CreateDiagramReq, UpdateDiagramReq } from "../schemas/diagram.schema";
-import { getProvider } from "../services/ai";
+import { getProviderFor, type CanonicalModel } from "../services/ai";
 import aicacheModel from "../models/aicache.model";
 import * as nodeCrypto from "node:crypto";
 
@@ -30,7 +30,7 @@ async function generateFromPrompt({
   titleOverride,
 }: {
   prompt: string;
-  model: "gpt5" | "gemini";
+  model: CanonicalModel;
   titleOverride?: string;
 }) {
   const key = makeKey(model, prompt);
@@ -43,9 +43,9 @@ async function generateFromPrompt({
     return { ...diagram, prompt, model };
   }
 
-  // 2) Call provider
-  const provider = getProvider(model);
-  const raw = await provider.generate(prompt);
+  // 2) Call provider (passes exact canonical model)
+  const provider = getProviderFor(model);
+  const raw = await provider.generate(prompt, model);
   const rawText = typeof raw === "string" ? raw : JSON.stringify(raw);
 
   // 3) Parse JSON (tolerant)
@@ -97,21 +97,25 @@ export async function deleteDiagram(req: Request, res: Response) {
   res.json(ok({}));
 }
 
-// POST /api/diagrams  (create by metadata only: name + type)
+// POST /api/diagrams  (create by metadata only: name + type [+ optional model])
 export async function createDiagram(req: Request, res: Response) {
   const parsed = CreateDiagramReq.safeParse({ body: req.body });
   if (!parsed.success) {
     return res.status(400).json(fail("Invalid diagram payload", "VALIDATION_ERROR"));
   }
 
-  const { name, type } = parsed.data.body;
+  const { name, type, model } = parsed.data.body as {
+    name: string;
+    type: string;
+    model?: CanonicalModel; // optional on create
+  };
 
   const doc = await Diagram.create({
     userId: req.user!.id,
     title: name.trim(),
-    type, // ✅ no enum; validated slug in zod
-    prompt: "(manual)",
-    model: "gpt5",
+    type, // validated slug in Zod
+    prompt: "",
+    model: (model as CanonicalModel) , // default canonical model
     nodes: [],
     edges: [],
   });
@@ -125,6 +129,7 @@ export async function createDiagram(req: Request, res: Response) {
 // - OR generate via AI when body contains { prompt, model? }
 export async function updateDiagram(req: Request, res: Response) {
   const parsed = UpdateDiagramReq.safeParse({ params: req.params, body: req.body });
+  console.log(parsed);
   if (!parsed.success) {
     return res.status(400).json(fail("Invalid update", "VALIDATION_ERROR"));
   }
@@ -137,48 +142,59 @@ export async function updateDiagram(req: Request, res: Response) {
     nodes?: any[];
     edges?: any[];
     prompt?: string;
-    model?: "gpt5" | "gemini";
+    model?: CanonicalModel;
   };
 
   // Ensure the diagram exists & belongs to the user
   const existing = await Diagram.findOne({ _id: id, userId: req.user!.id });
   if (!existing) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
 
-  const $set: Record<string, any> = {};
+  const updates: Record<string, any> = {};
 
   // metadata
-  if (name) $set.title = name.trim();
-  else if (title) $set.title = title.trim(); // backward compatible
-  if (typeof type === "string") $set.type = type;
+  if (typeof title === "string" && title.trim()) updates.title = title.trim();
+  if (typeof type === "string") updates.type = type;
 
   // content updates (manual)
-  if (Array.isArray(nodes)) $set.nodes = nodes;
-  if (Array.isArray(edges)) $set.edges = edges;
+  if (Array.isArray(nodes)) updates.nodes = nodes;
+  if (Array.isArray(edges)) updates.edges = edges;
 
   // AI generation path (merged into update)
   if (prompt && prompt.trim()) {
-    const chosenModel = model || "gpt5";
+    const chosenModel: CanonicalModel =
+      (model as CanonicalModel) || (existing.model as CanonicalModel) || "gpt-5";
 
     try {
       const generated = await generateFromPrompt({
         prompt: prompt.trim(),
         model: chosenModel,
-        titleOverride: $set.title, // use requested name if present
+        titleOverride: typeof title === "string" && title.trim() ? title.trim() : undefined,
       });
 
-      $set.nodes = generated.nodes;
-      $set.edges = generated.edges;
-      $set.prompt = generated.prompt;
-      $set.model = generated.model;
-
-      // if no title was provided in this request, use generated title
-      if (!$set.title) $set.title = generated.title;
+      updates.nodes = generated.nodes;
+      updates.edges = generated.edges;
+      updates.prompt = generated.prompt;
+      updates.model = chosenModel;
     } catch (err: any) {
       return res.status(502).json(fail(err?.message || "AI failed", "AI_FAILED"));
     }
+  } else if (model) {
+    // allow switching stored default model without regenerating now
+    updates.model = model;
+  }
+  // No-op: nothing to update
+  if (Object.keys(updates).length === 0) {
+    return res.json(ok(existing.toObject ? existing.toObject() : existing));
   }
 
-  const doc = await Diagram.findByIdAndUpdate(existing._id, { $set }, { new: true }).lean();
-
-  return res.json(ok(doc));
+  try {
+    const doc = await Diagram.findByIdAndUpdate(
+      existing._id,
+      { $set: updates },
+      { new: true },
+    ).lean();
+    return res.json(ok(doc));
+  } catch {
+    return res.status(500).json(fail("Failed to update diagram", "DB_ERROR"));
+  }
 }

@@ -6,7 +6,6 @@ const diagramSchema = new Schema(
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
     title: { type: String, default: "Untitled Diagram", trim: true },
 
-    // ✅ no hardcoded enum; just a slug-style string
     type: {
       type: String,
       required: true,
@@ -19,8 +18,16 @@ const diagramSchema = new Schema(
       },
     },
 
-    prompt: { type: String, required: true },
-    model: { type: String, enum: ["gpt5", "gemini"], default: "gpt5", index: true },
+    prompt: { type: String },
+
+    // ✅ canonical model IDs we support end-to-end
+    model: {
+      type: String,
+      enum: ["gpt-5", "gpt-5-mini", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
+      default: "gemini-2.5-flash-lite",
+      index: true,
+    },
+
     nodes: { type: [Schema.Types.Mixed], default: [] },
     edges: { type: [Schema.Types.Mixed], default: [] },
   },
