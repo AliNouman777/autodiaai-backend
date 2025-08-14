@@ -5,6 +5,7 @@ import { CreateDiagramReq, UpdateDiagramReq } from "../schemas/diagram.schema";
 import { getProviderFor, type CanonicalModel } from "../services/ai";
 import aicacheModel from "../models/aicache.model";
 import * as nodeCrypto from "node:crypto";
+import { isValidErd } from "../libs/isValidErd";
 
 // ---------- helpers ----------
 function ensureDiagramShape(obj: any) {
@@ -127,74 +128,87 @@ export async function createDiagram(req: Request, res: Response) {
 // - update metadata: name/type/title
 // - update content: nodes/edges
 // - OR generate via AI when body contains { prompt, model? }
+
 export async function updateDiagram(req: Request, res: Response) {
-  const parsed = UpdateDiagramReq.safeParse({ params: req.params, body: req.body });
-  console.log(parsed);
+  const parsed = UpdateDiagramReq.safeParse({
+    params: req.params,
+    body: req.body
+  });
+
   if (!parsed.success) {
     return res.status(400).json(fail("Invalid update", "VALIDATION_ERROR"));
   }
 
   const { id } = parsed.data.params;
-  const { name, title, type, nodes, edges, prompt, model } = parsed.data.body as {
-    name?: string;
-    title?: string; // legacy
-    type?: string;
-    nodes?: any[];
-    edges?: any[];
-    prompt?: string;
-    model?: CanonicalModel;
-  };
-
-  // Ensure the diagram exists & belongs to the user
-  const existing = await Diagram.findOne({ _id: id, userId: req.user!.id });
-  if (!existing) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
-
-  const updates: Record<string, any> = {};
-
-  // metadata
-  if (typeof title === "string" && title.trim()) updates.title = title.trim();
-  if (typeof type === "string") updates.type = type;
-
-  // content updates (manual)
-  if (Array.isArray(nodes)) updates.nodes = nodes;
-  if (Array.isArray(edges)) updates.edges = edges;
-
-  // AI generation path (merged into update)
-  if (prompt && prompt.trim()) {
-    const chosenModel: CanonicalModel =
-      (model as CanonicalModel) || (existing.model as CanonicalModel) || "gpt-5";
-
-    try {
-      const generated = await generateFromPrompt({
-        prompt: prompt.trim(),
-        model: chosenModel,
-        titleOverride: typeof title === "string" && title.trim() ? title.trim() : undefined,
-      });
-
-      updates.nodes = generated.nodes;
-      updates.edges = generated.edges;
-      updates.prompt = generated.prompt;
-      updates.model = chosenModel;
-    } catch (err: any) {
-      return res.status(502).json(fail(err?.message || "AI failed", "AI_FAILED"));
-    }
-  } else if (model) {
-    // allow switching stored default model without regenerating now
-    updates.model = model;
-  }
-  // No-op: nothing to update
-  if (Object.keys(updates).length === 0) {
-    return res.json(ok(existing.toObject ? existing.toObject() : existing));
-  }
+  const { name, title, type, nodes, edges, prompt, model } = parsed.data.body;
 
   try {
+    const existing = await Diagram.findOne({ _id: id, userId: req.user!.id });
+    if (!existing) {
+      return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
+    }
+
+    const updates: Record<string, any> = {};
+
+    if (typeof title === "string" && title.trim()) updates.title = title.trim();
+    if (typeof type === "string") updates.type = type;
+    if (Array.isArray(nodes)) updates.nodes = nodes;
+    if (Array.isArray(edges)) updates.edges = edges;
+
+    // AI generation path
+    if (prompt && prompt.trim()) {
+      if (!isValidErd(prompt)) {
+        return res.status(400).json(fail("Your prompt does not seem ERD-related.", "INVALID_ERD_PROMPT"));
+      }
+
+      const chosenModel = model || existing.model || "gpt-5";
+
+      try {
+        const generated = await generateFromPrompt({
+          prompt: prompt.trim(),
+          model: chosenModel,
+          titleOverride: title?.trim() || undefined,
+        });
+
+        updates.nodes = generated.nodes;
+        updates.edges = generated.edges;
+        updates.prompt = generated.prompt;
+        updates.model = chosenModel;
+
+      } catch (err: any) {
+        const errMsg = err?.message || "AI generation failed";
+
+        if (errMsg.includes("429") || /quota/i.test(errMsg)) {
+          return res.status(429).json(fail(errMsg, "AI_QUOTA_EXCEEDED"));
+        }
+
+        if (err?.response?.status) {
+          return res.status(err.response.status).json(fail(errMsg, "AI_FAILED"));
+        }
+
+        return res.status(502).json(fail(errMsg, "AI_FAILED"));
+      }
+    } else if (model) {
+      updates.model = model;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.json(ok(existing.toObject ? existing.toObject() : existing));
+    }
+
     const doc = await Diagram.findByIdAndUpdate(
       existing._id,
       { $set: updates },
-      { new: true },
+      { new: true }
     ).lean();
+
     return res.json(ok(doc));
-  } catch {
-    return res.status(500).json(fail("Failed to update diagram", "DB_ERROR"));
+
+  } catch (err) {
+    console.error("Update diagram error:", err);
+    return res.status(500).json(fail("Failed to update diagram", "SERVER_ERROR"));
   }
 }
+
+
+
