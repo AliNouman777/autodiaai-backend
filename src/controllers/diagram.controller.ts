@@ -116,7 +116,7 @@ export async function createDiagram(req: Request, res: Response) {
     title: name.trim(),
     type, // validated slug in Zod
     prompt: "",
-    model: (model as CanonicalModel) , // default canonical model
+    model: model as CanonicalModel, // default canonical model
     nodes: [],
     edges: [],
   });
@@ -132,7 +132,7 @@ export async function createDiagram(req: Request, res: Response) {
 export async function updateDiagram(req: Request, res: Response) {
   const parsed = UpdateDiagramReq.safeParse({
     params: req.params,
-    body: req.body
+    body: req.body,
   });
 
   if (!parsed.success) {
@@ -158,10 +158,12 @@ export async function updateDiagram(req: Request, res: Response) {
     // AI generation path
     if (prompt && prompt.trim()) {
       if (!isValidErd(prompt)) {
-        return res.status(400).json(fail("Your prompt does not seem ERD-related.", "INVALID_ERD_PROMPT"));
+        return res
+          .status(400)
+          .json(fail("Your prompt does not seem ERD-related.", "INVALID_ERD_PROMPT"));
       }
 
-      const chosenModel = model || existing.model || "gpt-5";
+      const chosenModel = model || existing.model;
 
       try {
         const generated = await generateFromPrompt({
@@ -174,7 +176,6 @@ export async function updateDiagram(req: Request, res: Response) {
         updates.edges = generated.edges;
         updates.prompt = generated.prompt;
         updates.model = chosenModel;
-
       } catch (err: any) {
         const errMsg = err?.message || "AI generation failed";
 
@@ -199,16 +200,12 @@ export async function updateDiagram(req: Request, res: Response) {
     const doc = await Diagram.findByIdAndUpdate(
       existing._id,
       { $set: updates },
-      { new: true }
+      { new: true },
     ).lean();
 
     return res.json(ok(doc));
-
   } catch (err) {
     console.error("Update diagram error:", err);
     return res.status(500).json(fail("Failed to update diagram", "SERVER_ERROR"));
   }
 }
-
-
-

@@ -35,7 +35,13 @@ export const DiagramNode = z.object({
   }),
 });
 
-const ModelEnum = z.enum(["gpt-5", "gpt-5-mini", "gemini-2.5-flash", "gemini-2.5-flash-lite"]);
+const ModelEnum = z.enum([
+  "gpt-5",
+  "gpt-5-mini",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "deepseek/deepseek-chat-v3-0324:free",
+]);
 
 /** Graph edge */
 export const DiagramEdge = z.object({

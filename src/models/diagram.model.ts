@@ -23,7 +23,13 @@ const diagramSchema = new Schema(
     // ✅ canonical model IDs we support end-to-end
     model: {
       type: String,
-      enum: ["gpt-5", "gpt-5-mini", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
+      enum: [
+        "gpt-5",
+        "gpt-5-mini",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "deepseek/deepseek-chat-v3-0324:free",
+      ],
       default: "gemini-2.5-flash-lite",
       index: true,
     },
