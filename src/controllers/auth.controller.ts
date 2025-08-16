@@ -66,7 +66,7 @@ export async function register(req: Request, res: Response) {
   const access = signJwt(
     { id: user.id, email: user.email, plan: user.plan },
     process.env.JWT_ACCESS_SECRET || "access",
-    { expiresIn: asExpires(process.env.JWT_ACCESS_EXPIRES, "15m") },
+    { expiresIn: asExpires(process.env.JWT_ACCESS_EXPIRES, "1440m") },
   );
 
   const refresh = signJwt({ id: user.id }, process.env.JWT_REFRESH_SECRET || "refresh", {

@@ -2,6 +2,7 @@
 import OpenAI from "openai";
 import { GoogleGenAI } from "@google/genai";
 import { DiagramPayload } from "../../schemas/diagram.schema";
+import { SYSTEM_PROMPT } from "../../Constant/ERDPrompt";
 
 /** Canonical model IDs you support end-to-end */
 export type CanonicalModel =
@@ -88,9 +89,6 @@ async function withTimeout<T>(p: Promise<T>, ms = 180000): Promise<T> {
     clearTimeout(t);
   }
 }
-
-export const SYSTEM_PROMPT = `You are a helpful and precise assistant that converts natural language descriptions of database models into JSON data for an Entity Relationship Diagram (ERD). Follow the rules strictly.
-[... your full SYSTEM_PROMPT content here ...]`;
 
 /* ---------------- Singletons ---------------- */
 const openAIClient = (() => {

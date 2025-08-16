@@ -3,9 +3,14 @@ import Diagram from "../models/diagram.model";
 import { ok, fail } from "../utils/http";
 import { CreateDiagramReq, UpdateDiagramReq } from "../schemas/diagram.schema";
 import { getProviderFor, type CanonicalModel } from "../services/ai";
+import { validateDiagram } from "../services/ai";
 import aicacheModel from "../models/aicache.model";
 import * as nodeCrypto from "node:crypto";
 import { isValidErd } from "../libs/isValidErd";
+import { erdToSql } from "../utils/sql/erdToSql";
+import { sanitizeFilename } from "../utils/file";
+import { pickDialect } from "../utils/sql/pickDialect";
+import { ZErd } from "../schemas/erd";
 
 // ---------- helpers ----------
 function ensureDiagramShape(obj: any) {
@@ -207,5 +212,53 @@ export async function updateDiagram(req: Request, res: Response) {
   } catch (err) {
     console.error("Update diagram error:", err);
     return res.status(500).json(fail("Failed to update diagram", "SERVER_ERROR"));
+  }
+}
+
+/**
+ * GET /api/diagrams/:id/export.sql
+ * Optional query:
+ *  - dialect=postgres|mysql|sqlite
+ *  - schema=<name> (Postgres only)
+ *  - filename=<base name without .sql>
+ */
+export async function exportDiagramSql(req: Request, res: Response) {
+  try {
+    const { id } = req.params;
+
+    const doc = await Diagram.findOne({ _id: id, userId: req.user!.id }).lean();
+    if (!doc) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
+
+    const erd = ZErd.parse({ nodes: doc.nodes ?? [], edges: doc.edges ?? [] });
+
+    const dialect = pickDialect(req /*, userDefault */);
+    const schema =
+      dialect.supportsSchema() && typeof req.query.schema === "string"
+        ? (req.query.schema as string)
+        : "";
+
+    const sql = erdToSql(erd, {
+      dialect,
+      schema,
+      addIdentity: true,
+      addFkIndexes: true,
+      addNotNull: true,
+      addTimestampsDefault: true,
+    });
+
+    const base = sanitizeFilename(
+      (req.query.filename as string) || doc.title || (doc as any).name || "diagram",
+    );
+    const fileName = `${base}.sql`;
+
+    res.setHeader("Content-Type", "application/sql; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+    );
+    res.send(sql);
+  } catch (err) {
+    console.error("exportDiagramSql error:", err);
+    res.status(500).json(fail("Failed to export SQL", "SERVER_ERROR"));
   }
 }
