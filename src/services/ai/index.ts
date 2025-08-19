@@ -1,8 +1,9 @@
-// src/services/ai.ts
+// src/services/ai/index.ts
 import OpenAI from "openai";
 import { GoogleGenAI } from "@google/genai";
-import { DiagramPayload } from "../../schemas/diagram.schema";
+
 import { SYSTEM_PROMPT } from "../../Constant/ERDPrompt";
+import { normalizeErd, ZErdLoose } from "../../schemas/erd-ai";
 
 /** Canonical model IDs you support end-to-end */
 export type CanonicalModel =
@@ -22,7 +23,10 @@ function providerKindFor(model: CanonicalModel): "openai" | "gemini" | "openrout
 /** Common interface all providers implement */
 export interface ERDProvider {
   name: "openai" | "gemini" | "openrouter";
-  generate(userPrompt: string, model: CanonicalModel): Promise<ReturnType<typeof validateDiagram>>;
+  generate(
+    userPrompt: string,
+    model: CanonicalModel,
+  ): Promise<ReturnType<typeof validateAndNormalize>>;
   generateStream?(userPrompt: string, model: CanonicalModel): AsyncGenerator<string, void, unknown>;
 }
 
@@ -38,19 +42,19 @@ function tryParseJson(s: string) {
   }
 }
 
-export function validateDiagram(raw: any) {
+/** Parse -> validate (loose) -> normalize (strict: markers + handle sides + type) */
+export function validateAndNormalize(raw: unknown) {
   const obj = typeof raw === "string" ? tryParseJson(raw) : raw;
-  const parsed = (DiagramPayload as any).safeParse(obj);
+
+  const parsed = ZErdLoose.safeParse(obj);
   if (!parsed.success) {
-    if (process.env.DEBUG) {
-      const preview = (typeof raw === "string" ? raw : JSON.stringify(raw)).slice(0, 500);
-      console.warn("[ERD] Invalid JSON preview:", preview);
-      console.warn("[ERD] Issues:", parsed.error.flatten());
-    }
-    const issue = parsed.error.issues[0];
-    throw new Error(`Invalid diagram JSON: ${issue.path.join(".")} ${issue.message}`);
+    const first = parsed.error.issues?.[0];
+    const where = first?.path?.length ? first.path.join(".") + " " : "";
+    throw new Error(`Invalid diagram JSON: ${where}${first?.message || "validation failed"}`);
   }
-  return parsed.data;
+
+  // 🔧 Upgrade to strict (adds/repairs markerStart/markerEnd, fixes handle sides, sets type)
+  return normalizeErd(parsed.data);
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -102,7 +106,8 @@ const geminiClient = (() => {
   if (!process.env.GEMINI_API_KEY && process.env.NODE_ENV !== "test") {
     console.warn("[Gemini] GEMINI_API_KEY is missing");
   }
-  return new GoogleGenAI({});
+  // @google/genai requires passing apiKey in the ctor
+  return new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 })();
 
 /* ---------------- OpenAI provider ---------------- */
@@ -110,9 +115,8 @@ class OpenAIProvider implements ERDProvider {
   name = "openai" as const;
 
   async generate(userPrompt: string, model: CanonicalModel) {
-    if (!(model === "gpt-5" || model === "gpt-5-mini")) {
+    if (!(model === "gpt-5" || model === "gpt-5-mini"))
       throw new Error(`OpenAIProvider received unsupported model: ${model}`);
-    }
 
     const run = async () => {
       const resp = await openAIClient.responses.create({
@@ -127,7 +131,7 @@ class OpenAIProvider implements ERDProvider {
 
       const text = resp.output_text ?? "";
       if (!text) throw new Error("Empty response from OpenAI");
-      return validateDiagram(text);
+      return validateAndNormalize(text);
     };
 
     return withTimeout(withRetry(run));
@@ -139,45 +143,41 @@ class GeminiProvider implements ERDProvider {
   name = "gemini" as const;
 
   async generate(userPrompt: string, model: CanonicalModel) {
-    if (!(model === "gemini-2.5-flash" || model === "gemini-2.5-flash-lite")) {
+    if (!(model === "gemini-2.5-flash" || model === "gemini-2.5-flash-lite"))
       throw new Error(`GeminiProvider received unsupported model: ${model}`);
-    }
 
     const run = async () => {
       const resp = await (geminiClient as any).models.generateContent({
         model,
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: `${SYSTEM_PROMPT}\n\nUSER REQUEST:\n${userPrompt}` }],
-          },
-        ],
         generationConfig: {
           responseMimeType: "application/json",
           temperature: 0,
           maxOutputTokens: 4000,
         },
+        contents: [
+          { role: "user", parts: [{ text: `${SYSTEM_PROMPT}\n\nUSER REQUEST:\n${userPrompt}` }] },
+        ],
       });
 
       let text: string | undefined;
       const maybeText = (resp as any).text;
-      if (typeof maybeText === "function") {
-        text = await maybeText.call(resp);
-      } else if (typeof maybeText === "string") {
-        text = maybeText;
-      } else if (Array.isArray((resp as any).candidates)) {
-        const c = (resp as any).candidates[0];
-        const parts = c?.content?.parts;
-        if (Array.isArray(parts)) {
-          text = parts
-            .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
-            .filter(Boolean)
-            .join("\n");
-        }
+      if (typeof maybeText === "function") text = await maybeText.call(resp);
+      else if (typeof maybeText === "string") text = maybeText;
+      else if (resp?.response?.candidates?.[0]?.content?.parts) {
+        text = resp.response.candidates[0].content.parts
+          .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
+          .join("\n");
+      }
+
+      if (process.env.DEBUG) {
+        try {
+          console.debug("[Gemini] raw resp (truncated):", JSON.stringify(resp).slice(0, 1500));
+        } catch {}
+        console.debug("[Gemini] text (first 1500 chars):", (text ?? "").slice(0, 1500));
       }
 
       if (!text || !text.trim()) throw new Error("Empty response from Gemini");
-      return validateDiagram(text);
+      return validateAndNormalize(text);
     };
 
     return withTimeout(withRetry(run));
@@ -194,15 +194,15 @@ class OpenRouterProvider implements ERDProvider {
       Authorization: `Bearer ${process.env.OPENROUTER_API_KEY ?? ""}`,
       "Content-Type": "application/json",
     };
+    // Optional attribution headers per OpenRouter’s guidelines
     if (process.env.OPENROUTER_SITE_URL) headers["HTTP-Referer"] = process.env.OPENROUTER_SITE_URL;
     if (process.env.OPENROUTER_SITE_NAME) headers["X-Title"] = process.env.OPENROUTER_SITE_NAME;
     return headers;
   }
 
   async generate(userPrompt: string, model: CanonicalModel) {
-    if (!model.startsWith("deepseek/")) {
+    if (!model.startsWith("deepseek/"))
       throw new Error(`OpenRouterProvider received unsupported model: ${model}`);
-    }
     if (!process.env.OPENROUTER_API_KEY && process.env.NODE_ENV !== "test") {
       throw Object.assign(new Error("[OpenRouter] OPENROUTER_API_KEY is missing"), { status: 401 });
     }
@@ -214,6 +214,7 @@ class OpenRouterProvider implements ERDProvider {
         body: JSON.stringify({
           model,
           temperature: 0,
+          // ✅ ask for JSON
           response_format: { type: "json_object" },
           messages: [
             { role: "system", content: SYSTEM_PROMPT },
@@ -237,61 +238,10 @@ class OpenRouterProvider implements ERDProvider {
             : "";
 
       if (!text.trim()) throw new Error("Empty response from OpenRouter");
-      return validateDiagram(text);
+      return validateAndNormalize(text);
     };
 
     return withTimeout(withRetry(run));
-  }
-
-  async *generateStream(userPrompt: string, model: CanonicalModel) {
-    if (!model.startsWith("deepseek/")) {
-      throw new Error(`OpenRouterProvider received unsupported model: ${model}`);
-    }
-
-    const res = await fetch(this.endpoint, {
-      method: "POST",
-      headers: this.buildHeaders(),
-      body: JSON.stringify({
-        model,
-        temperature: 0,
-        stream: true,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userPrompt },
-        ],
-      }),
-    });
-
-    if (!res.ok || !res.body) {
-      throw new Error(`[OpenRouter] Streaming failed with status ${res.status}`);
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() || "";
-
-      for (const part of parts) {
-        if (part.startsWith("data: ")) {
-          const data = part.slice(6);
-          if (data === "[DONE]") return;
-          try {
-            const json = JSON.parse(data);
-            const delta = json?.choices?.[0]?.delta?.content;
-            if (delta) yield delta;
-          } catch {
-            // ignore malformed
-          }
-        }
-      }
-    }
   }
 }
 
