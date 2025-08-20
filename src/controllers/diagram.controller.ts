@@ -1,6 +1,6 @@
 // diagram.controller.ts
-import type { Request, Response } from "express";
-import Diagram, { DiagramDoc } from "../models/diagram.model";
+import type { NextFunction, Request, Response } from "express";
+import { DiagramModel, type DiagramDoc } from "../models/diagram.model";
 import { ok, fail } from "../utils/http";
 import {
   CreateDiagramReq,
@@ -19,11 +19,30 @@ import { erdToSql } from "../utils/sql/erdToSql";
 import { sanitizeFilename } from "../utils/file";
 import { pickDialect } from "../utils/sql/pickDialect";
 import { normalizeErd, ZErdStrict } from "../schemas/erd-ai";
-import { HydratedDocument } from "mongoose";
 import { DialectRenderer } from "../utils/sql/dialects";
 import z from "zod";
+import { Types } from "mongoose";
 
-// ---------- helpers ----------
+/* ---------------------------- owner helpers --------------------------- */
+
+type OwnerFilter =
+  | { userId: Types.ObjectId; ownerAnonId?: never }
+  | { ownerAnonId: string; userId?: never };
+
+function getOwnerFilter(req: Request): OwnerFilter {
+  const userId = (req as any).user?.id as string | undefined;
+  if (userId) return { userId: new Types.ObjectId(userId) };
+
+  const aid = req.signedCookies?.aid as string | undefined;
+  if (!aid) {
+    // Ensure cookie-parser (with secret) + ensureAnonId middleware are mounted on the router
+    throw new Error("Missing anon id (cookie 'aid' not set)");
+  }
+  return { ownerAnonId: aid };
+}
+
+/* ------------------------------ utilities ---------------------------- */
+
 function ensureDiagramShape(obj: any) {
   if (!obj || typeof obj !== "object") throw new Error("Bad AI output");
   if (!Array.isArray(obj.nodes) || !Array.isArray(obj.edges)) {
@@ -34,9 +53,8 @@ function ensureDiagramShape(obj: any) {
       ? obj.title.trim()
       : "Untitled Diagram";
 
-  // ⬇️ Normalize to strict (adds markers if missing)
+  // Normalize (adds markers if missing)
   const strict = normalizeErd({ nodes: obj.nodes, edges: obj.edges });
-
   return { title, nodes: strict.nodes, edges: strict.edges };
 }
 
@@ -59,7 +77,6 @@ async function generateFromPrompt({
   // 1) Try cache
   const hit = await aicacheModel.findOne({ key }).lean();
   if (hit) {
-    // Cache stores normalized payload (after this change)
     const diagram = ensureDiagramShape(hit.payload);
     if (titleOverride) diagram.title = titleOverride;
     return { ...diagram, prompt, model };
@@ -81,7 +98,7 @@ async function generateFromPrompt({
     else throw new Error("AI did not return JSON");
   }
 
-  const diagram = ensureDiagramShape(parsed); // ⬅️ includes normalizeErd inside
+  const diagram = ensureDiagramShape(parsed);
   if (titleOverride) diagram.title = titleOverride;
 
   // 4) Save cache (normalized!)
@@ -90,7 +107,7 @@ async function generateFromPrompt({
   return { ...diagram, prompt, model };
 }
 
-type Loaded = { diagram: HydratedDocument<DiagramDoc>; node: any };
+type Loaded = { diagram: DiagramDoc; node: any };
 type NotFound = { error: "Diagram not found" | "Node not found" };
 
 function escapeRegExp(s: string) {
@@ -121,20 +138,28 @@ function removeEdgesTouchingField(diagram: any, fieldId: string) {
   );
 }
 
-/* Load a diagram and a specific node (subdoc), making sure data/schema exist and are cast correctly) */
+/* Load a diagram and a specific node (subdoc); owner-aware */
 export async function loadDiagramWithNode(
+  req: Request,
   diagramId: string,
-  userId: string,
   nodeId: string,
 ): Promise<Loaded | NotFound> {
-  // IMPORTANT: do not .lean() — we need Mongoose docs/subdocs
-  const diagram = await Diagram.findOne({ _id: diagramId, userId });
+  if (!Types.ObjectId.isValid(diagramId)) {
+    return { error: "Diagram not found" };
+  }
+
+  const owner = getOwnerFilter(req);
+  const diagram = await DiagramModel.findOne({
+    _id: new Types.ObjectId(diagramId),
+    ...owner,
+  });
+
   if (!diagram) return { error: "Diagram not found" };
 
   const node: any = (diagram.nodes ?? []).find((n: any) => n?.id === nodeId);
   if (!node) return { error: "Node not found" };
 
-  // Use subdocument .set() so Mongoose casts arrays to DocumentArray (avoids TS2740)
+  // Ensure subdoc structure exists/cast correctly
   if (!node.data) {
     node.set?.("data", { label: "Table", schema: [] });
   } else if (!Array.isArray(node.data.schema)) {
@@ -144,79 +169,134 @@ export async function loadDiagramWithNode(
   return { diagram, node };
 }
 
-// ---------- CRUD ----------
+/* ============================= CRUD ============================= */
 
 // GET /api/diagrams
-export async function listMyDiagrams(req: Request, res: Response) {
-  const page = Math.max(1, Number(req.query.page) || 1);
-  const limit = Math.min(100, Number(req.query.limit) || 20);
-  const skip = (page - 1) * limit;
+export async function listMyDiagrams(req: Request, res: Response, next: NextFunction) {
+  try {
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(100, Number(req.query.limit) || 20);
+    const skip = (page - 1) * limit;
 
-  const [items, total] = await Promise.all([
-    Diagram.find({ userId: req.user!.id }).sort({ updatedAt: -1 }).skip(skip).limit(limit).lean(),
-    Diagram.countDocuments({ userId: req.user!.id }),
-  ]);
+    const owner = getOwnerFilter(req);
+    const [items, total] = await Promise.all([
+      DiagramModel.find(owner).sort({ updatedAt: -1 }).skip(skip).limit(limit).lean(),
+      DiagramModel.countDocuments(owner),
+    ]);
 
-  return res.json(ok({ items, page, limit, total, pages: Math.ceil(total / limit) }));
+    return res.json(ok({ items, page, limit, total, pages: Math.ceil(total / limit) }));
+  } catch (err) {
+    // DO NOT send a response here; pass to error middleware
+    console.error("[listMyDiagrams] error:", err);
+    return next(err);
+  }
 }
 
 // GET /api/diagrams/:id
 export async function getDiagram(req: Request, res: Response) {
-  const doc = await Diagram.findOne({ _id: req.params.id, userId: req.user!.id }).lean();
-  if (!doc) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
-  res.json(ok(doc));
+  try {
+    const { id } = req.params;
+    if (!Types.ObjectId.isValid(id)) {
+      return res.status(400).json(fail("Invalid diagram id", "BAD_ID"));
+    }
+
+    const owner = getOwnerFilter(req);
+    const doc = await DiagramModel.findOne({ _id: new Types.ObjectId(id), ...owner }).lean();
+
+    if (!doc) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
+    return res.json(ok(doc));
+  } catch (err) {
+    console.error("[getDiagram] error:", err);
+    return res.status(500).json(fail("Failed to fetch diagram", "SERVER_ERROR"));
+  }
 }
 
 // DELETE /api/diagrams/:id
 export async function deleteDiagram(req: Request, res: Response) {
-  const r = await Diagram.deleteOne({ _id: req.params.id, userId: req.user!.id });
-  if (!r.deletedCount) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
-  res.json(ok({}));
+  try {
+    const { id } = req.params;
+    if (!Types.ObjectId.isValid(id)) {
+      return res.status(400).json(fail("Invalid diagram id", "BAD_ID"));
+    }
+
+    const owner = getOwnerFilter(req);
+    const r = await DiagramModel.deleteOne({ _id: new Types.ObjectId(id), ...owner });
+    if (!r.deletedCount) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
+    return res.json(ok({}));
+  } catch (err) {
+    console.error("[deleteDiagram] error:", err);
+    return res.status(500).json(fail("Failed to delete diagram", "SERVER_ERROR"));
+  }
 }
 
-// POST /api/diagrams  (create by metadata only: name + type [+ optional model])
+// POST /api/diagrams
+// create by metadata only: name + type [+ optional model]
+// POST /api/diagrams
+// create by metadata only: name + type [+ optional model]
+// Guests (no req.user) are limited to 4 diagrams total
 export async function createDiagram(req: Request, res: Response) {
-  const parsed = CreateDiagramReq.safeParse({ body: req.body });
-  if (!parsed.success) {
-    return res.status(400).json(fail("Invalid diagram payload", "VALIDATION_ERROR"));
+  try {
+    const parsed = CreateDiagramReq.safeParse({ body: req.body });
+    if (!parsed.success) {
+      return res.status(400).json(fail("Invalid diagram payload", "VALIDATION_ERROR"));
+    }
+
+    const { name, type, model } = parsed.data.body as {
+      name: string;
+      type: string;
+      model?: CanonicalModel;
+    };
+
+    // figure out owner (userId or ownerAnonId)
+    const owner = getOwnerFilter(req);
+
+    // If this is a guest (no req.user), cap at 4 diagrams
+    const isGuest = !(req as any).user?.id;
+    if (isGuest) {
+      const aid = req.signedCookies?.aid as string | undefined;
+      if (!aid) {
+        // Shouldn't happen if ensureAnonId is mounted, but guard anyway
+        return res.status(400).json(fail("Missing anon id", "MISSING_AID"));
+      }
+
+      const count = await DiagramModel.countDocuments({ ownerAnonId: aid });
+      if (count >= 4) {
+        return res
+          .status(403)
+          .json(
+            fail("Guest diagram limit reached (4). Please sign in to create more.", "GUEST_LIMIT"),
+          );
+      }
+    }
+
+    const doc = await DiagramModel.create({
+      ...owner, // exactly one of userId / ownerAnonId
+      title: name.trim(),
+      type, // validated slug in Zod
+      prompt: "",
+      model: (model as CanonicalModel) ?? "gemini-2.5-flash-lite",
+      nodes: [],
+      edges: [],
+    });
+
+    return res.status(201).json(ok(doc));
+  } catch (err) {
+    console.error("[createDiagram] error:", err);
+    return res.status(500).json(fail("Failed to create diagram", "SERVER_ERROR"));
   }
-
-  const { name, type, model } = parsed.data.body as {
-    name: string;
-    type: string;
-    model?: CanonicalModel; // optional on create
-  };
-
-  const doc = await Diagram.create({
-    userId: req.user!.id,
-    title: name.trim(),
-    type, // validated slug in Zod
-    prompt: "",
-    model: model as CanonicalModel, // default canonical model
-    nodes: [],
-    edges: [],
-  });
-
-  return res.status(201).json(ok(doc));
 }
 
 // PATCH /api/diagrams/:id
-// - update metadata: name/type/title
+// - update metadata: title/type
 // - update content: nodes/edges
 // - OR generate via AI when body contains { prompt, model? }
-
 export async function updateDiagram(req: Request, res: Response) {
   if (!UpdateDiagramReq || typeof (UpdateDiagramReq as any).safeParse !== "function") {
-    console.error(
-      "[DiagramCtrl] UpdateDiagramReq is undefined or not a Zod schema. Check imports.",
-    );
+    console.error("[DiagramCtrl] UpdateDiagramReq missing/invalid");
     return res.status(500).json(fail("Server schema not loaded", "SERVER_CONFIG"));
   }
 
-  const parsed = UpdateDiagramReq.safeParse({
-    params: req.params,
-    body: req.body,
-  });
+  const parsed = UpdateDiagramReq.safeParse({ params: req.params, body: req.body });
   if (!parsed.success) {
     return res.status(400).json(fail("Invalid update", "VALIDATION_ERROR"));
   }
@@ -225,13 +305,17 @@ export async function updateDiagram(req: Request, res: Response) {
   const { title, type, nodes, edges, prompt, model } = parsed.data.body;
 
   try {
-    const existing = await Diagram.findOne({ _id: id, userId: req.user!.id });
+    if (!Types.ObjectId.isValid(id)) {
+      return res.status(400).json(fail("Invalid diagram id", "BAD_ID"));
+    }
+
+    const owner = getOwnerFilter(req);
+    const existing = await DiagramModel.findOne({ _id: new Types.ObjectId(id), ...owner });
     if (!existing) {
       return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
     }
 
     const updates: Record<string, any> = {};
-
     if (typeof title === "string" && title.trim()) updates.title = title.trim();
     if (typeof type === "string") updates.type = type;
 
@@ -254,7 +338,7 @@ export async function updateDiagram(req: Request, res: Response) {
           .json(fail("Your prompt does not seem ERD-related.", "INVALID_ERD_PROMPT"));
       }
 
-      const chosenModel = (model || existing.model) as CanonicalModel;
+      const chosenModel = (model || (existing as any).model) as CanonicalModel;
 
       try {
         const generated = await generateFromPrompt({
@@ -263,15 +347,13 @@ export async function updateDiagram(req: Request, res: Response) {
           titleOverride: title?.trim() || undefined,
         });
 
-        // generated already normalized by ensureDiagramShape()
         updates.nodes = generated.nodes;
         updates.edges = generated.edges;
         updates.prompt = generated.prompt;
         updates.model = chosenModel;
       } catch (err: any) {
-        console.error("[DiagramCtrl] updateDiagram:AI-path:error", err);
+        console.error("[updateDiagram:AI] error:", err);
         const errMsg = err?.message || "AI generation failed";
-
         if (errMsg.includes("429") || /quota/i.test(errMsg)) {
           return res.status(429).json(fail(errMsg, "AI_QUOTA_EXCEEDED"));
         }
@@ -288,26 +370,30 @@ export async function updateDiagram(req: Request, res: Response) {
       return res.json(ok(existing.toObject ? existing.toObject() : existing));
     }
 
-    const doc = await Diagram.findByIdAndUpdate(
+    const doc = await DiagramModel.findByIdAndUpdate(
       existing._id,
       { $set: updates },
       { new: true },
     ).lean();
     return res.json(ok(doc));
   } catch (err) {
+    console.error("[updateDiagram] error:", err);
     return res.status(500).json(fail("Failed to update diagram", "SERVER_ERROR"));
   }
 }
 
-/**
- * GET /api/diagrams/:id/export.sql
- */
+/* -------------------------- SQL export route ------------------------- */
 
+// GET /api/diagrams/:id/export.sql
 export async function exportDiagramSql(req: Request, res: Response) {
   try {
     const { id } = req.params;
+    if (!Types.ObjectId.isValid(id)) {
+      return res.status(400).json(fail("Invalid diagram id", "BAD_ID"));
+    }
 
-    const doc = await Diagram.findOne({ _id: id, userId: req.user!.id }).lean();
+    const owner = getOwnerFilter(req);
+    const doc = await DiagramModel.findOne({ _id: new Types.ObjectId(id), ...owner }).lean();
     if (!doc) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
 
     const rawErd = { nodes: (doc as any).nodes ?? [], edges: (doc as any).edges ?? [] };
@@ -315,11 +401,7 @@ export async function exportDiagramSql(req: Request, res: Response) {
     // Prefer strict validation. If it fails (old data), normalize on the fly.
     let erd: z.infer<typeof ZErdStrict>;
     const parsed = ZErdStrict.safeParse(rawErd);
-    if (parsed.success) {
-      erd = parsed.data;
-    } else {
-      erd = normalizeErd(rawErd); // ⬅️ upgrade legacy documents lacking markers
-    }
+    erd = parsed.success ? parsed.data : normalizeErd(rawErd);
 
     let dialect: DialectRenderer;
     try {
@@ -354,6 +436,7 @@ export async function exportDiagramSql(req: Request, res: Response) {
     );
     res.send(sql);
   } catch (err) {
+    console.error("[exportDiagramSql] error:", err);
     res.status(500).json(fail("Failed to export SQL", "SERVER_ERROR"));
   }
 }
@@ -369,7 +452,7 @@ export async function addNodeField(req: Request, res: Response) {
   const { id, nodeId } = parsed.data.params;
   const field = parsed.data.body;
 
-  const loaded = await loadDiagramWithNode(id, req.user!.id, nodeId);
+  const loaded = await loadDiagramWithNode(req, id, nodeId);
   if ("error" in loaded) return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
   const { diagram, node } = loaded;
 
@@ -397,7 +480,7 @@ export async function updateNodeField(req: Request, res: Response) {
   const { id, nodeId, fieldId } = parsed.data.params;
   const patch = parsed.data.body; // may include { id?, title?, type?, key? }
 
-  const loaded = await loadDiagramWithNode(id, req.user!.id, nodeId);
+  const loaded = await loadDiagramWithNode(req, id, nodeId);
   if ("error" in loaded) return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
   const { diagram, node } = loaded;
 
@@ -405,7 +488,6 @@ export async function updateNodeField(req: Request, res: Response) {
 
   // ---------- UPSERT: Create if not found ----------
   if (idx === -1) {
-    // For create, require these
     const newId = (patch.id ?? fieldId)?.trim();
     const title = patch.title?.trim();
     const type = patch.type?.trim();
@@ -439,7 +521,6 @@ export async function updateNodeField(req: Request, res: Response) {
   if (patch.id && patch.id !== current.id) {
     const dup = node.data!.schema.some((f: any) => f.id === patch.id);
     if (dup) return res.status(409).json(fail("New field id already exists", "CONFLICT"));
-    // rewrite edge handles from old id to new id
     rewriteHandlesForFieldRename(diagram, current.id, patch.id);
   }
 
@@ -464,7 +545,7 @@ export async function deleteNodeField(req: Request, res: Response) {
   }
   const { id, nodeId, fieldId } = parsed.data.params;
 
-  const loaded = await loadDiagramWithNode(id, req.user!.id, nodeId);
+  const loaded = await loadDiagramWithNode(req, id, nodeId);
   if ("error" in loaded) return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
   const { diagram, node } = loaded;
 
@@ -490,7 +571,7 @@ export async function reorderNodeFields(req: Request, res: Response) {
   const { id, nodeId } = parsed.data.params;
   const { order } = parsed.data.body;
 
-  const loaded = await loadDiagramWithNode(id, req.user!.id, nodeId);
+  const loaded = await loadDiagramWithNode(req, id, nodeId);
   if ("error" in loaded) return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
   const { diagram, node } = loaded;
 
@@ -520,7 +601,7 @@ export async function updateNodeLabel(req: Request, res: Response) {
   const { id, nodeId } = parsed.data.params;
   const { label } = parsed.data.body;
 
-  const loaded = await loadDiagramWithNode(id, req.user!.id, nodeId);
+  const loaded = await loadDiagramWithNode(req, id, nodeId);
   if ("error" in loaded) return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
   const { diagram, node } = loaded;
 

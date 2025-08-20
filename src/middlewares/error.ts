@@ -1,9 +1,18 @@
-import { NextFunction, Request, Response } from "express";
-import logger from "../libs/logger";
+// src/middlewares/error.ts
+import type { Request, Response, NextFunction } from "express";
+import { fail } from "../utils/http";
 
 export function errorHandler(err: any, _req: Request, res: Response, _next: NextFunction) {
-  const status = err.statusCode ?? 500;
-  const message = err.message ?? "Internal Server Error";
-  logger.error({ err }, "Unhandled error");
-  res.status(status).json({ success: false, error: { code: status, message } });
+  // If a handler already sent something, do not attempt to write again
+  if (res.headersSent || res.writableEnded) {
+    return;
+  }
+
+  const status =
+    (typeof err?.status === "number" && err.status) ||
+    (typeof err?.statusCode === "number" && err.statusCode) ||
+    500;
+
+  const message = err?.message || "Unexpected error";
+  res.status(status).json(fail(message, status >= 500 ? "SERVER_ERROR" : "BAD_REQUEST"));
 }

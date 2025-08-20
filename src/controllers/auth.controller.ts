@@ -1,10 +1,12 @@
 // src/controllers/auth.controller.ts
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
-import User from "../models/user.model";
+import { UserModel } from "../models/user.model";
 import { signJwt } from "../utils/jwt";
 import { ok, fail } from "../utils/http";
 import type { SignOptions } from "jsonwebtoken";
+import mongoose, { Types } from "mongoose";
+import { DiagramModel } from "../models/diagram.model"; // ← NEW: needed for merge
 
 const asExpires = (
   value: string | undefined,
@@ -14,7 +16,7 @@ const asExpires = (
 
 // cookie helpers
 const isProd = process.env.NODE_ENV === "production";
-const ACCESS_MAX_AGE = 15 * 60 * 1000; // 15 minutes
+const ACCESS_MAX_AGE = 120 * 60 * 1000; // 120 minutes
 const REFRESH_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 function setAuthCookies(res: Response, access: string, refresh?: string) {
@@ -41,6 +43,35 @@ function clearAuthCookies(res: Response) {
   res.clearCookie("refresh", { path: "/" });
 }
 
+/** --------------------------------------------------------------
+ * Merge any guest-owned diagrams (ownerAnonId == aid) into userId.
+ * Runs in a transaction. Safe to call even if there’s nothing to merge.
+ * -------------------------------------------------------------- */
+async function mergeGuestDiagramsToUser(aid: string | undefined, userId: string) {
+  if (!aid) return { merged: 0 };
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const res = await DiagramModel.updateMany(
+      { ownerAnonId: aid },
+      {
+        $set: { userId: new Types.ObjectId(userId) },
+        $unset: { ownerAnonId: "" },
+      },
+      { session },
+    );
+
+    await session.commitTransaction();
+    return { merged: (res as any).modifiedCount ?? 0 };
+  } catch (err) {
+    await session.abortTransaction();
+    throw err;
+  } finally {
+    session.endSession();
+  }
+}
+
 export async function register(req: Request, res: Response) {
   const { firstName, lastName, email, password } = req.body as {
     firstName: string;
@@ -49,13 +80,13 @@ export async function register(req: Request, res: Response) {
     password: string;
   };
 
-  const exists = await User.findOne({ email });
+  const exists = await UserModel.findOne({ email });
   if (exists) {
     return res.status(409).json(fail("Email already registered", "EMAIL_TAKEN"));
   }
 
   const hashed = await bcrypt.hash(password, 10);
-  const user = await User.create({
+  const user = await UserModel.create({
     firstName,
     lastName,
     email,
@@ -73,7 +104,21 @@ export async function register(req: Request, res: Response) {
     expiresIn: asExpires(process.env.JWT_REFRESH_EXPIRES, "7d"),
   });
 
+  // ✅ set cookies on register
   setAuthCookies(res, access, refresh);
+
+  // ✅ NEW: merge guest diagrams (if any) on first account creation
+  try {
+    const aid = req.signedCookies?.aid as string | undefined;
+    if (aid) {
+      await mergeGuestDiagramsToUser(aid, user.id);
+      // Clear the guest cookie so we won't try merging again
+      res.clearCookie("aid", { path: "/" });
+    }
+  } catch (e) {
+    // Do not fail registration if merge fails
+    console.error("[register] mergeGuestDiagramsToUser failed:", e);
+  }
 
   return res.status(201).json(
     ok({
@@ -91,7 +136,7 @@ export async function register(req: Request, res: Response) {
 
 export async function login(req: Request, res: Response) {
   const { email, password } = req.body as { email: string; password: string };
-  const user = await User.findOne({ email });
+  const user = await UserModel.findOne({ email });
   if (!user) return res.status(401).json(fail("Invalid credentials", "BAD_LOGIN"));
 
   const match = await bcrypt.compare(password, user.password);
@@ -109,10 +154,23 @@ export async function login(req: Request, res: Response) {
   // ✅ set cookies on login
   setAuthCookies(res, access, refresh);
 
+  // ✅ NEW: merge any guest diagrams owned by this browser (aid) into this user
+  try {
+    const aid = req.signedCookies?.aid as string | undefined;
+    if (aid) {
+      await mergeGuestDiagramsToUser(aid, user.id);
+      // Clear the guest cookie now that content is owned by the user
+      res.clearCookie("aid", { path: "/" });
+    }
+  } catch (e) {
+    // Don’t block login if merge fails; just log it
+    console.error("[login] mergeGuestDiagramsToUser failed:", e);
+  }
+
   return res.json(
     ok({
       user: { id: user.id, email: user.email, plan: user.plan },
-      tokens: { access, refresh }, // ← optional to return
+      tokens: { access, refresh }, // optional to return
     }),
   );
 }

@@ -13,7 +13,8 @@ import cookieParser from "cookie-parser";
 export function createServer() {
   const app = express();
 
-  app.use(cookieParser(process.env.COOKIE_SECRET));
+  app.use(cookieParser(process.env.COOKIE_SECRET || "dev-secret"));
+
   app.use(pinoHttp({ logger }));
   app.use(helmet());
   app.use(

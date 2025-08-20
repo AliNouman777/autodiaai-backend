@@ -1,6 +1,7 @@
 // src/routes/diagram.routes.ts
 import { Router } from "express";
-import { requireAuth } from "../middlewares/auth";
+import { softAuth } from "../middlewares/softAuth";
+import { ensureAnonId } from "../middlewares/ensureAnonId";
 import {
   createDiagram,
   deleteDiagram,
@@ -17,34 +18,25 @@ import {
 
 const router = Router();
 
-/* --------------------------- Diagram CRUD --------------------------- */
+// 1) Attach logged-in user if token is present
+router.use(softAuth);
 
-router.get("/diagrams", requireAuth, listMyDiagrams);
-router.get("/diagrams/:id", requireAuth, getDiagram);
-router.post("/diagrams", requireAuth, createDiagram);
-router.patch("/diagrams/:id", requireAuth, updateDiagram);
-router.get("/diagrams/:id/export.sql", requireAuth, exportDiagramSql);
-router.delete("/diagrams/:id", requireAuth, deleteDiagram);
+// 2) Only if NOT logged in, ensure anon id exists
+router.use(ensureAnonId);
+
+/* --------------------------- Diagram CRUD --------------------------- */
+router.get("/diagrams", listMyDiagrams);
+router.get("/diagrams/:id", getDiagram);
+router.post("/diagrams", createDiagram);
+router.patch("/diagrams/:id", updateDiagram);
+router.get("/diagrams/:id/export.sql", exportDiagramSql);
+router.delete("/diagrams/:id", deleteDiagram);
 
 /* ------------------------ Node Schema (fields) ----------------------- */
-/**
- * IMPORTANT: Put the "reorder" route BEFORE ":fieldId" routes
- * so "/schema/reorder" doesn't get captured by ":fieldId".
- */
-
-// Rename table label
-router.patch("/diagrams/:id/nodes/:nodeId/label", requireAuth, updateNodeLabel);
-
-// Reorder fields (must be before :fieldId)
-router.patch("/diagrams/:id/nodes/:nodeId/schema/reorder", requireAuth, reorderNodeFields);
-
-// Add new field (column)
-router.post("/diagrams/:id/nodes/:nodeId/schema", requireAuth, addNodeField);
-
-// Update a field (column)
-router.patch("/diagrams/:id/nodes/:nodeId/schema/:fieldId", requireAuth, updateNodeField);
-
-// Delete a field (column)
-router.delete("/diagrams/:id/nodes/:nodeId/schema/:fieldId", requireAuth, deleteNodeField);
+router.patch("/diagrams/:id/nodes/:nodeId/label", updateNodeLabel);
+router.patch("/diagrams/:id/nodes/:nodeId/schema/reorder", reorderNodeFields);
+router.post("/diagrams/:id/nodes/:nodeId/schema", addNodeField);
+router.patch("/diagrams/:id/nodes/:nodeId/schema/:fieldId", updateNodeField);
+router.delete("/diagrams/:id/nodes/:nodeId/schema/:fieldId", deleteNodeField);
 
 export default router;
