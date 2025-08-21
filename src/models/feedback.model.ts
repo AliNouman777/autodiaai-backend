@@ -2,7 +2,6 @@ import { Schema, model, InferSchemaType, Types } from "mongoose";
 
 const FeedbackSchema = new Schema(
   {
-    category: { type: String, required: true, trim: true, maxlength: 120 }, // e.g. diagram type
     name: { type: String, required: true, trim: true, maxlength: 120 },
     feedback: { type: String, required: true, trim: true, maxlength: 5000 },
   },

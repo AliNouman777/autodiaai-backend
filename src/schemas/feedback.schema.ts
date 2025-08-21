@@ -3,7 +3,6 @@
 import { z } from "zod";
 
 export const FeedbackInput = z.object({
-  category: z.string().trim().min(1).max(120),
   name: z.string().trim().min(1).max(120),
   feedback: z.string().trim().min(1).max(5000),
 });
