@@ -230,10 +230,8 @@ export async function deleteDiagram(req: Request, res: Response) {
 }
 
 // POST /api/diagrams
-// create by metadata only: name + type [+ optional model]
-// POST /api/diagrams
-// create by metadata only: name + type [+ optional model]
-// Guests (no req.user) are limited to 4 diagrams total
+// Guests (no req.user) limited to 4 diagrams
+// Logged-in users with plan=free limited to 10 diagrams
 export async function createDiagram(req: Request, res: Response) {
   try {
     const parsed = CreateDiagramReq.safeParse({ body: req.body });
@@ -250,15 +248,14 @@ export async function createDiagram(req: Request, res: Response) {
     // figure out owner (userId or ownerAnonId)
     const owner = getOwnerFilter(req);
 
-    // If this is a guest (no req.user), cap at 4 diagrams
-    const isGuest = !(req as any).user?.id;
+    const user = (req as any).user;
+    const isGuest = !user?.id;
+
     if (isGuest) {
       const aid = req.signedCookies?.aid as string | undefined;
       if (!aid) {
-        // Shouldn't happen if ensureAnonId is mounted, but guard anyway
         return res.status(400).json(fail("Missing anon id", "MISSING_AID"));
       }
-
       const count = await DiagramModel.countDocuments({ ownerAnonId: aid });
       if (count >= 4) {
         return res
@@ -267,12 +264,24 @@ export async function createDiagram(req: Request, res: Response) {
             fail("Guest diagram limit reached (4). Please sign in to create more.", "GUEST_LIMIT"),
           );
       }
+    } else {
+      // logged-in user; enforce plan-based limits
+      if (user.plan === "free") {
+        const count = await DiagramModel.countDocuments({ userId: user.id });
+        if (count >= 10) {
+          return res
+            .status(403)
+            .json(
+              fail("Free plan limit reached (10 diagrams). Upgrade to create more.", "FREE_LIMIT"),
+            );
+        }
+      }
     }
 
     const doc = await DiagramModel.create({
-      ...owner, // exactly one of userId / ownerAnonId
+      ...owner,
       title: name.trim(),
-      type, // validated slug in Zod
+      type,
       prompt: "",
       model: (model as CanonicalModel) ?? "gemini-2.5-flash-lite",
       nodes: [],

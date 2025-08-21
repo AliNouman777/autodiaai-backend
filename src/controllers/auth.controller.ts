@@ -6,7 +6,7 @@ import { signJwt } from "../utils/jwt";
 import { ok, fail } from "../utils/http";
 import type { SignOptions } from "jsonwebtoken";
 import mongoose, { Types } from "mongoose";
-import { DiagramModel } from "../models/diagram.model"; // ← NEW: needed for merge
+import { DiagramModel } from "../models/diagram.model";
 
 const asExpires = (
   value: string | undefined,
@@ -45,10 +45,20 @@ function clearAuthCookies(res: Response) {
 
 /** --------------------------------------------------------------
  * Merge any guest-owned diagrams (ownerAnonId == aid) into userId.
+ * If plan is "free" and user already has 10 diagrams, skip merge entirely.
  * Runs in a transaction. Safe to call even if there’s nothing to merge.
  * -------------------------------------------------------------- */
-async function mergeGuestDiagramsToUser(aid: string | undefined, userId: string) {
+async function mergeGuestDiagramsToUser(
+  aid: string | undefined,
+  userId: string,
+  plan: "free" | "pro",
+) {
   if (!aid) return { merged: 0 };
+
+  if (plan === "free") {
+    const current = await DiagramModel.countDocuments({ userId });
+    if (current >= 10) return { merged: 0 };
+  }
 
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -81,9 +91,7 @@ export async function register(req: Request, res: Response) {
   };
 
   const exists = await UserModel.findOne({ email });
-  if (exists) {
-    return res.status(409).json(fail("Email already registered", "EMAIL_TAKEN"));
-  }
+  if (exists) return res.status(409).json(fail("Email already registered", "EMAIL_TAKEN"));
 
   const hashed = await bcrypt.hash(password, 10);
   const user = await UserModel.create({
@@ -104,19 +112,16 @@ export async function register(req: Request, res: Response) {
     expiresIn: asExpires(process.env.JWT_REFRESH_EXPIRES, "7d"),
   });
 
-  // ✅ set cookies on register
   setAuthCookies(res, access, refresh);
 
-  // ✅ NEW: merge guest diagrams (if any) on first account creation
+  // merge guest diagrams if allowed by plan
   try {
     const aid = req.signedCookies?.aid as string | undefined;
     if (aid) {
-      await mergeGuestDiagramsToUser(aid, user.id);
-      // Clear the guest cookie so we won't try merging again
+      await mergeGuestDiagramsToUser(aid, user.id, user.plan as "free" | "pro");
       res.clearCookie("aid", { path: "/" });
     }
   } catch (e) {
-    // Do not fail registration if merge fails
     console.error("[register] mergeGuestDiagramsToUser failed:", e);
   }
 
@@ -129,7 +134,7 @@ export async function register(req: Request, res: Response) {
         email: user.email,
         plan: user.plan,
       },
-      tokens: { access, refresh }, // optional to return refresh
+      tokens: { access, refresh },
     }),
   );
 }
@@ -151,26 +156,23 @@ export async function login(req: Request, res: Response) {
     expiresIn: asExpires(process.env.JWT_REFRESH_EXPIRES, "7d"),
   });
 
-  // ✅ set cookies on login
   setAuthCookies(res, access, refresh);
 
-  // ✅ NEW: merge any guest diagrams owned by this browser (aid) into this user
+  // merge guest diagrams if allowed by plan
   try {
     const aid = req.signedCookies?.aid as string | undefined;
     if (aid) {
-      await mergeGuestDiagramsToUser(aid, user.id);
-      // Clear the guest cookie now that content is owned by the user
+      await mergeGuestDiagramsToUser(aid, user.id, user.plan as "free" | "pro");
       res.clearCookie("aid", { path: "/" });
     }
   } catch (e) {
-    // Don’t block login if merge fails; just log it
     console.error("[login] mergeGuestDiagramsToUser failed:", e);
   }
 
   return res.json(
     ok({
       user: { id: user.id, email: user.email, plan: user.plan },
-      tokens: { access, refresh }, // optional to return
+      tokens: { access, refresh },
     }),
   );
 }
@@ -178,11 +180,10 @@ export async function login(req: Request, res: Response) {
 export async function me(req: Request, res: Response) {
   if (!req.user) return res.status(401).json(fail("Unauthorized", "UNAUTHORIZED"));
 
-  // rotate a fresh access token in the cookie
   const newAccess = signJwt(
     { id: req.user.id, email: req.user.email, plan: req.user.plan },
     process.env.JWT_ACCESS_SECRET || "access",
-    { expiresIn: asExpires(process.env.JWT_ACCESS_EXPIRES, "15m") },
+    { expiresIn: asExpires(process.env.JWT_ACCESS_EXPIRES, "120m") },
   );
 
   setAuthCookies(res, newAccess);
