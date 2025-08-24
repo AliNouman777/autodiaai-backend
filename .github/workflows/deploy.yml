@@ -34,7 +34,9 @@ jobs:
 
       # 6. Zip deployment package
       - name: Zip deployment package
-        run: zip -r deploy.zip dist package.json Procfile node_modules -x "*.git*" "*.github/*" "*.vscode/*" "*.env"
+        run: |
+          zip -r deploy.zip dist package.json Procfile node_modules \
+          -x "*.git*" "*.github/*" "*.vscode/*" "*.env"
 
       # 7. Deploy to Elastic Beanstalk
       - name: Deploy to Elastic Beanstalk
