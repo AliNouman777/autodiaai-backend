@@ -1,12 +1,12 @@
 import { NextFunction, Request, Response } from "express";
-import Diagram from "../models/diagram.model";
+import {DiagramModel} from "../models/diagram.model";
 
 export async function enforceFreePlanLimit(req: Request, res: Response, next: NextFunction) {
   if (!req.user)
     return res.status(401).json({ success: false, error: { code: 401, message: "Unauthorized" } });
   if (req.user.plan !== "free") return next();
 
-  const count = await Diagram.countDocuments({ userId: req.user.id });
+  const count = await DiagramModel.countDocuments({ userId: req.user.id });
   if (count >= 4) {
     return res.status(403).json({
       success: false,

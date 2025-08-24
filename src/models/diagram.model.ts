@@ -125,5 +125,5 @@ DiagramSchema.index({ userId: 1, updatedAt: -1 });
 DiagramSchema.index({ ownerAnonId: 1, updatedAt: -1 });
 
 /** The Model must be Model<DiagramAttrs>, NOT Model<DiagramDoc> */
-export const DiagramModel: Model<DiagramAttrs> =
+export  const DiagramModel: Model<DiagramAttrs> =
   (models.Diagram as Model<DiagramAttrs>) || model<DiagramAttrs>("Diagram", DiagramSchema);
