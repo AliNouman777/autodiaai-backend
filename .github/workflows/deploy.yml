@@ -10,33 +10,33 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Checkout code
+      # 1. Checkout code
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # 2️⃣ Setup Node.js
+      # 2. Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '22'
 
-      # 3️⃣ Install dependencies
+      # 3. Install dependencies
       - name: Install dependencies
         run: npm install
 
-      # 4️⃣ Build TypeScript app
+      # 4. Build TypeScript app
       - name: Build application
         run: npm run build
 
-      # 5️⃣ Create Procfile
+      # 5. Create Procfile
       - name: Create Procfile
         run: echo "web: node dist/index.js" > Procfile
 
-      # 6️⃣ Zip deployment package
+      # 6. Zip deployment package
       - name: Zip deployment package
         run: zip -r deploy.zip dist package.json Procfile node_modules -x "*.git*" "*.github/*" "*.vscode/*" "*.env"
 
-      # 7️⃣ Deploy to Elastic Beanstalk
+      # 7. Deploy to Elastic Beanstalk
       - name: Deploy to Elastic Beanstalk
         uses: einaregilsson/beanstalk-deploy@v20
         with:
