@@ -3,7 +3,7 @@ name: Deploy to Elastic Beanstalk
 on:
   push:
     branches:
-      - main   # or master, depending on your branch
+      - main
 
 jobs:
   deploy:
@@ -15,13 +15,17 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v3
         with:
-          node-version: '22'   # same as EB platform
+          node-version: '22'
 
       - name: Install dependencies
         run: npm install
 
       - name: Build app
         run: npm run build
+
+      # Create deployment zip (include everything Elastic Beanstalk needs)
+      - name: Zip deployment package
+        run: zip -r deploy.zip . -x "*.git*" "node_modules/*" "*.github/*"
 
       - name: Deploy to Elastic Beanstalk
         uses: einaregilsson/beanstalk-deploy@v20
@@ -32,4 +36,5 @@ jobs:
           environment_name: ${{ secrets.EB_ENV_NAME }}
           version_label: github-${{ github.sha }}
           region: ${{ secrets.AWS_REGION }}
-          deployment_package: ./ # or zip your build folder if needed
+          deployment_package: deploy.zip
+ 
