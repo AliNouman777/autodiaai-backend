@@ -1,45 +1,43 @@
-name: Deploy to Elastic Beanstalk
+name: Production Deploy to Elastic Beanstalk
 
 on:
   push:
     branches:
-      - main  # change if your default branch is different
+      - main  # Deploy only from main branch
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: production  # Optional: GitHub environment for secrets & approvals
 
     steps:
       # 1️⃣ Checkout code
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # 2️⃣ Cache node_modules for faster installs
-      - name: Cache node modules
-        uses: actions/cache@v3
-        with:
-          path: node_modules
-          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
-
-      # 3️⃣ Setup Node.js
-      - name: Set up Node.js
+      # 2️⃣ Set up Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '22'
+          cache: 'npm'
 
-      # 4️⃣ Install dependencies
+      # 3️⃣ Install dependencies
       - name: Install dependencies
-        run: npm install
+        run: npm ci  # Use ci in prod for deterministic installs
 
-      # 5️⃣ Build TypeScript app
+      # 4️⃣ Build the TypeScript application
       - name: Build application
         run: npm run build
 
-      # 6️⃣ Create deployment zip (exclude unnecessary files)
-      - name: Zip deployment package
-        run: zip -r deploy.zip . -x "*.git*" "*.github/*" "*.vscode/*" "*.env"
+      # 5️⃣ Create Procfile dynamically for EB
+      - name: Create Procfile
+        run: echo "web: node dist/index.js" > Procfile
+
+      # 6️⃣ Create deployment ZIP
+      - name: Package application
+        run: |
+          zip -r deploy.zip dist package.json Procfile node_modules -x "*.git*" "*.github/*" "*.vscode/*" "*.env" "tests/*" "docs/*"
 
       # 7️⃣ Deploy to Elastic Beanstalk
       - name: Deploy to Elastic Beanstalk
@@ -53,3 +51,15 @@ jobs:
           region: ${{ secrets.AWS_REGION }}
           deployment_package: deploy.zip
           wait_for_deployment: true
+
+      # 8️⃣ Post-deploy health check
+      - name: Check application health
+        run: |
+          HEALTH=$(aws elasticbeanstalk describe-environments \
+            --application-name ${{ secrets.EB_APP_NAME }} \
+            --environment-names ${{ secrets.EB_ENV_NAME }} \
+            --query "Environments[0].Health" --output text)
+          if [ "$HEALTH" != "Green" ]; then
+            echo "❌ Environment health is $HEALTH. Failing deployment."
+            exit 1
+          fi
