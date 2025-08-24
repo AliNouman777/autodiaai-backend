@@ -3,30 +3,45 @@ name: Deploy to Elastic Beanstalk
 on:
   push:
     branches:
-      - main
+      - main  # change if your default branch is different
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
+      # 1️⃣ Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v3
 
+      # 2️⃣ Cache node_modules for faster installs
+      - name: Cache node modules
+        uses: actions/cache@v3
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      # 3️⃣ Setup Node.js
       - name: Set up Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '22'
 
+      # 4️⃣ Install dependencies
       - name: Install dependencies
         run: npm install
 
-      - name: Build app
+      # 5️⃣ Build TypeScript app
+      - name: Build application
         run: npm run build
 
-      # Create deployment zip (include everything Elastic Beanstalk needs)
+      # 6️⃣ Create deployment zip (exclude unnecessary files)
       - name: Zip deployment package
-        run: zip -r deploy.zip . -x "*.git*" "node_modules/*" "*.github/*"
+        run: zip -r deploy.zip . -x "*.git*" "*.github/*" "*.vscode/*" "*.env"
 
+      # 7️⃣ Deploy to Elastic Beanstalk
       - name: Deploy to Elastic Beanstalk
         uses: einaregilsson/beanstalk-deploy@v20
         with:
@@ -37,4 +52,4 @@ jobs:
           version_label: github-${{ github.sha }}
           region: ${{ secrets.AWS_REGION }}
           deployment_package: deploy.zip
- 
+          wait_for_deployment: true
