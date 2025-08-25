@@ -9,8 +9,10 @@ import { errorHandler } from "./middlewares/error";
 import logger from "./libs/logger";
 import env from "./config/env";
 import cookieParser from "cookie-parser";
+import { getLiveness, getReadiness } from "./controllers/health.controller";
 
 export function createServer() {
+  const router = express.Router();
   const app = express();
 
   // IMPORTANT for HTTPS behind Elastic Beanstalk / ALB
@@ -66,6 +68,9 @@ export function createServer() {
     }),
   );
 
+  // API routes
+  router.get("/", getLiveness);
+  router.get("/ready", getReadiness);
   app.use("/api", api);
 
   app.use((_req, res) =>
