@@ -1,12 +1,15 @@
 // src/controllers/auth.controller.ts
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
-import { UserModel } from "../models/user.model";
-import { signJwt } from "../utils/jwt";
-import { ok, fail } from "../utils/http";
 import type { SignOptions } from "jsonwebtoken";
 import mongoose, { Types } from "mongoose";
+
+import { UserModel } from "../models/user.model";
 import { DiagramModel } from "../models/diagram.model";
+import { signJwt } from "../utils/jwt";
+import { ok, fail } from "../utils/http";
+
+/* ----------------------------- helpers ----------------------------- */
 
 const asExpires = (
   value: string | undefined,
@@ -14,40 +17,82 @@ const asExpires = (
 ): SignOptions["expiresIn"] =>
   value && value.trim() ? (value.trim() as SignOptions["expiresIn"]) : fallback;
 
-// cookie helpers
-const isProd = process.env.NODE_ENV === "production";
+// Cookie lifetimes
 const ACCESS_MAX_AGE = 120 * 60 * 1000; // 120 minutes
 const REFRESH_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+/**
+ * Build a Set-Cookie string using attributes that work in cross-site contexts
+ * (localhost -> api.autodia.tech) under Chrome's 3P cookie phaseout.
+ * We deliberately do NOT set a Domain attribute; it will default to api host.
+ */
+function buildCookie({
+  name,
+  value,
+  maxAgeMs,
+  deleteCookie = false,
+}: {
+  name: string;
+  value?: string;
+  maxAgeMs?: number;
+  deleteCookie?: boolean;
+}) {
+  const parts: string[] = [];
+
+  // For deletion, send an empty value; otherwise the provided token
+  parts.push(`${name}=${deleteCookie ? "" : (value ?? "")}`);
+
+  parts.push("Path=/");
+  parts.push("HttpOnly");
+  parts.push("Secure");
+  // Cross-site fetch requires None; Lax/Strict will block on XHR/fetch
+  parts.push("SameSite=None");
+  // Partitioned cookies (CHIPS) so Chrome will allow 3P cookie set/send
+  parts.push("Partitioned");
+
+  if (deleteCookie) {
+    parts.push("Max-Age=0");
+    parts.push("Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+  } else if (typeof maxAgeMs === "number") {
+    const secs = Math.floor(maxAgeMs / 1000);
+    const exp = new Date(Date.now() + maxAgeMs).toUTCString();
+    parts.push(`Max-Age=${secs}`);
+    parts.push(`Expires=${exp}`);
+  }
+
+  return parts.join("; ");
+}
+
+/** Append Set-Cookie safely even if other middleware also sets cookies */
+function appendSetCookie(res: Response, cookieStr: string) {
+  const prev = res.getHeader("Set-Cookie");
+  if (!prev) {
+    res.setHeader("Set-Cookie", cookieStr);
+  } else if (Array.isArray(prev)) {
+    res.setHeader("Set-Cookie", [...prev, cookieStr]);
+  } else {
+    res.setHeader("Set-Cookie", [prev as string, cookieStr]);
+  }
+}
+
 function setAuthCookies(res: Response, access: string, refresh?: string) {
-  res.cookie("access", access, {
-    httpOnly: true,
-    secure: isProd,
-    sameSite: "lax",
-    path: "/",
-    maxAge: ACCESS_MAX_AGE,
-  });
+  appendSetCookie(res, buildCookie({ name: "access", value: access, maxAgeMs: ACCESS_MAX_AGE }));
   if (refresh) {
-    res.cookie("refresh", refresh, {
-      httpOnly: true,
-      secure: isProd,
-      sameSite: "lax",
-      path: "/",
-      maxAge: REFRESH_MAX_AGE,
-    });
+    appendSetCookie(
+      res,
+      buildCookie({ name: "refresh", value: refresh, maxAgeMs: REFRESH_MAX_AGE }),
+    );
   }
 }
 
 function clearAuthCookies(res: Response) {
-  res.clearCookie("access", { path: "/" });
-  res.clearCookie("refresh", { path: "/" });
+  appendSetCookie(res, buildCookie({ name: "access", deleteCookie: true }));
+  appendSetCookie(res, buildCookie({ name: "refresh", deleteCookie: true }));
 }
 
-/** --------------------------------------------------------------
- * Merge any guest-owned diagrams (ownerAnonId == aid) into userId.
+/* Merge any guest-owned diagrams (ownerAnonId == aid) into userId.
  * If plan is "free" and user already has 10 diagrams, skip merge entirely.
- * Runs in a transaction. Safe to call even if there’s nothing to merge.
- * -------------------------------------------------------------- */
+ * Runs in a transaction. Safe to call even if there’s nothing to merge. */
 async function mergeGuestDiagramsToUser(
   aid: string | undefined,
   userId: string,
@@ -71,9 +116,8 @@ async function mergeGuestDiagramsToUser(
       },
       { session },
     );
-
     await session.commitTransaction();
-    return { merged: (res as any).modifiedCount ?? 0 };
+    return { merged: res.modifiedCount ?? 0 };
   } catch (err) {
     await session.abortTransaction();
     throw err;
@@ -81,6 +125,8 @@ async function mergeGuestDiagramsToUser(
     session.endSession();
   }
 }
+
+/* ----------------------------- controllers ----------------------------- */
 
 export async function register(req: Request, res: Response) {
   const { firstName, lastName, email, password } = req.body as {
@@ -186,6 +232,7 @@ export async function me(req: Request, res: Response) {
     { expiresIn: asExpires(process.env.JWT_ACCESS_EXPIRES, "120m") },
   );
 
+  // refresh token remains as-is; rotate only access here
   setAuthCookies(res, newAccess);
   return res.json(ok({ user: req.user }));
 }
