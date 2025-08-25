@@ -71,6 +71,8 @@ export function createServer() {
   // API routes
   router.get("/", getLiveness);
   router.get("/ready", getReadiness);
+
+  app.use("/", router);
   app.use("/api", api);
 
   app.use((_req, res) =>
