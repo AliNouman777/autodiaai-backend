@@ -14,9 +14,10 @@ export function createServer() {
   const app = express();
 
   app.use(cookieParser(process.env.COOKIE_SECRET || "dev-secret"));
-  
+
   app.use(pinoHttp({ logger }));
-  app.use(helmet());
+  app.use(helmet({ crossOriginOpenerPolicy: false }));
+
   app.use(
     cors({
       origin: env.CORS_ORIGIN === "*" ? true : env.CORS_ORIGIN,
