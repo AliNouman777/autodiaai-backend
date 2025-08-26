@@ -35,25 +35,21 @@ export function createServer() {
   );
 
   // CORS (credentials + explicit origin)
-  const ALLOWED_ORIGINS =
-    env.CORS_ORIGIN === "*"
-      ? true // reflect request origin — safe with credentials in `cors` package
-      : Array.isArray(env.CORS_ORIGIN)
-        ? env.CORS_ORIGIN
-        : [env.CORS_ORIGIN];
+  const ALLOWED_ORIGINS = env.CORS_ORIGIN.split(",").map((s) => s.trim());
 
   app.use(
     cors({
-      origin: ALLOWED_ORIGINS,
+      origin(origin, cb) {
+        if (!origin) return cb(null, true);
+        if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+        return cb(new Error(`CORS blocked for origin: ${origin}`));
+      },
       credentials: true,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
       allowedHeaders: ["Content-Type", "Authorization"],
       optionsSuccessStatus: 204,
     }),
   );
-
-  // Useful for EB health checks (optional)
-  // app.get("/health", (_req, res) => res.status(200).send("OK"));
 
   app.use(compression());
   app.use(express.json({ limit: "1mb" }));
