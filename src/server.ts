@@ -1,4 +1,5 @@
 import express from "express";
+import session from "express-session";
 import cors from "cors";
 import helmet from "helmet";
 import compression from "compression";
@@ -10,32 +11,54 @@ import logger from "./libs/logger";
 import env from "./config/env";
 import cookieParser from "cookie-parser";
 import { getLiveness, getReadiness } from "./controllers/health.controller";
+import passport from "passport";
+import oauthRouter from "./routes/oauth.routes";
 
 export function createServer() {
   const router = express.Router();
   const app = express();
 
-  // IMPORTANT for HTTPS behind Elastic Beanstalk / ALB
+  // Trust proxy (needed for correct IP/HTTPS handling behind proxies)
   app.set("trust proxy", 1);
 
-  // Cookies (signed if you use req.signedCookies)
-  app.use(cookieParser(process.env.COOKIE_SECRET || "dev-secret"));
+  // Cookies (signed)
+  app.use(cookieParser(process.env.COOKIE_SECRET || "dev-cookie-secret"));
 
-  // Logging first
+  // Session (needed for OIDC state/nonce during the OAuth handshake)
+  app.use(
+    session({
+      name: "sid",
+      secret: process.env.SESSION_SECRET || "dev-session-secret",
+      resave: false,
+      saveUninitialized: false,
+      cookie: {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "lax",
+        maxAge: 10 * 60 * 1000,
+      },
+    }),
+  );
+
+  // Passport (after session, before routes)
+  app.use(passport.initialize());
+
+  // Logging
   app.use(pinoHttp({ logger }));
 
-  // Helmet: disable COOP/COEP for now to avoid the warning until you're fully on HTTPS+COEP
+  // Security headers
   app.use(
     helmet({
       crossOriginOpenerPolicy: false,
       crossOriginEmbedderPolicy: false,
-      // If CSP breaks your dev assets, you can disable temporarily:
-      // contentSecurityPolicy: false,
     }),
   );
 
-  // CORS (credentials + explicit origin)
-  const ALLOWED_ORIGINS = env.CORS_ORIGIN.split(",").map((s) => s.trim());
+  // CORS
+  const ALLOWED_ORIGINS = (env.CORS_ORIGIN || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
   app.use(
     cors({
@@ -55,6 +78,7 @@ export function createServer() {
   app.use(express.json({ limit: "1mb" }));
   app.use(express.urlencoded({ extended: true }));
 
+  // Basic rate limit
   app.use(
     rateLimit({
       windowMs: 60_000,
@@ -64,17 +88,29 @@ export function createServer() {
     }),
   );
 
-  // API routes
+  // ---------- Health ----------
   router.get("/", getLiveness);
   router.get("/ready", getReadiness);
-
   app.use("/", router);
+
+  // ---------- API ----------
   app.use("/api", api);
 
+  // ---------- OAuth (Google OIDC) ----------
+  app.use("/auth/google", oauthRouter);
+
+  // Backward-compat alias
+  app.get("/api/auth/oauth/google", (req, res) => {
+    const qs = req.url.includes("?") ? req.url.substring(req.url.indexOf("?")) : "";
+    return res.redirect(302, `/auth/google/login${qs}`);
+  });
+
+  // 404
   app.use((_req, res) =>
     res.status(404).json({ success: false, error: { code: 404, message: "Not Found" } }),
   );
 
+  // Global error handler
   app.use(errorHandler);
 
   return app;

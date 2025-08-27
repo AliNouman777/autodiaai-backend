@@ -1,225 +1,130 @@
-// src/controllers/auth.controller.ts
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import type { SignOptions } from "jsonwebtoken";
-import mongoose, { Types } from "mongoose";
-
 import { UserModel } from "../models/user.model";
-import { DiagramModel } from "../models/diagram.model";
 import { signJwt } from "../utils/jwt";
 import { ok, fail } from "../utils/http";
+import { clearAuthCookies, setAuthCookies } from "../utils/cookies";
+import { mergeGuestDiagramsToUser } from "../utils/guest-merge";
 
-/* ----------------------------- helpers ----------------------------- */
-
-const asExpires = (
+function asExpires(
   value: string | undefined,
   fallback: SignOptions["expiresIn"],
-): SignOptions["expiresIn"] =>
-  value && value.trim() ? (value.trim() as SignOptions["expiresIn"]) : fallback;
-
-// Cookie lifetimes
-const ACCESS_MAX_AGE = 120 * 60 * 1000; // 120 minutes
-const REFRESH_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
-
-/**
- * Build a Set-Cookie string using attributes that work in cross-site contexts
- * (localhost -> api.autodia.tech) under Chrome's 3P cookie phaseout.
- * We deliberately do NOT set a Domain attribute; it will default to api host.
- */
-function buildCookie({
-  name,
-  value,
-  maxAgeMs,
-  deleteCookie = false,
-}: {
-  name: string;
-  value?: string;
-  maxAgeMs?: number;
-  deleteCookie?: boolean;
-}) {
-  const parts: string[] = [];
-
-  // For deletion, send an empty value; otherwise the provided token
-  parts.push(`${name}=${deleteCookie ? "" : (value ?? "")}`);
-
-  parts.push("Path=/");
-  parts.push("HttpOnly");
-  parts.push("Secure");
-  // Cross-site fetch requires None; Lax/Strict will block on XHR/fetch
-  parts.push("SameSite=None");
-  // Partitioned cookies (CHIPS) so Chrome will allow 3P cookie set/send
-  parts.push("Partitioned");
-
-  if (deleteCookie) {
-    parts.push("Max-Age=0");
-    parts.push("Expires=Thu, 01 Jan 1970 00:00:00 GMT");
-  } else if (typeof maxAgeMs === "number") {
-    const secs = Math.floor(maxAgeMs / 1000);
-    const exp = new Date(Date.now() + maxAgeMs).toUTCString();
-    parts.push(`Max-Age=${secs}`);
-    parts.push(`Expires=${exp}`);
-  }
-
-  return parts.join("; ");
+): SignOptions["expiresIn"] {
+  return value && value.trim() ? (value.trim() as SignOptions["expiresIn"]) : fallback;
 }
 
-/** Append Set-Cookie safely even if other middleware also sets cookies */
-function appendSetCookie(res: Response, cookieStr: string) {
-  const prev = res.getHeader("Set-Cookie");
-  if (!prev) {
-    res.setHeader("Set-Cookie", cookieStr);
-  } else if (Array.isArray(prev)) {
-    res.setHeader("Set-Cookie", [...prev, cookieStr]);
-  } else {
-    res.setHeader("Set-Cookie", [prev as string, cookieStr]);
-  }
-}
-
-function setAuthCookies(res: Response, access: string, refresh?: string) {
-  appendSetCookie(res, buildCookie({ name: "access", value: access, maxAgeMs: ACCESS_MAX_AGE }));
-  if (refresh) {
-    appendSetCookie(
-      res,
-      buildCookie({ name: "refresh", value: refresh, maxAgeMs: REFRESH_MAX_AGE }),
-    );
-  }
-}
-
-function clearAuthCookies(res: Response) {
-  appendSetCookie(res, buildCookie({ name: "access", deleteCookie: true }));
-  appendSetCookie(res, buildCookie({ name: "refresh", deleteCookie: true }));
-}
-
-/* Merge any guest-owned diagrams (ownerAnonId == aid) into userId.
- * If plan is "free" and user already has 10 diagrams, skip merge entirely.
- * Runs in a transaction. Safe to call even if there’s nothing to merge. */
-async function mergeGuestDiagramsToUser(
-  aid: string | undefined,
-  userId: string,
-  plan: "free" | "pro",
-) {
-  if (!aid) return { merged: 0 };
-
-  if (plan === "free") {
-    const current = await DiagramModel.countDocuments({ userId });
-    if (current >= 10) return { merged: 0 };
-  }
-
-  const session = await mongoose.startSession();
-  session.startTransaction();
-  try {
-    const res = await DiagramModel.updateMany(
-      { ownerAnonId: aid },
-      {
-        $set: { userId: new Types.ObjectId(userId) },
-        $unset: { ownerAnonId: "" },
-      },
-      { session },
-    );
-    await session.commitTransaction();
-    return { merged: res.modifiedCount ?? 0 };
-  } catch (err) {
-    await session.abortTransaction();
-    throw err;
-  } finally {
-    session.endSession();
-  }
-}
-
-/* ----------------------------- controllers ----------------------------- */
+const ACCESS_EXPIRES: SignOptions["expiresIn"] =
+  (process.env.JWT_ACCESS_EXPIRES as SignOptions["expiresIn"]) || "15m";
+const REFRESH_EXPIRES: SignOptions["expiresIn"] =
+  (process.env.JWT_REFRESH_EXPIRES as SignOptions["expiresIn"]) || "7d";
 
 export async function register(req: Request, res: Response) {
-  const { firstName, lastName, email, password } = req.body as {
+  const { firstName, lastName, password } = req.body as {
     firstName: string;
     lastName: string;
     email: string;
     password: string;
   };
 
+  // ✅ normalize email the same way as the schema
+  const email = (req.body.email || "").trim().toLowerCase();
+
+  // Pre-check for nicer UX (still keep DB-level catch for races)
   const exists = await UserModel.findOne({ email });
   if (exists) return res.status(409).json(fail("Email already registered", "EMAIL_TAKEN"));
 
   const hashed = await bcrypt.hash(password, 10);
-  const user = await UserModel.create({
-    firstName,
-    lastName,
-    email,
-    password: hashed,
-    plan: "free",
-  });
 
-  const access = signJwt(
-    { id: user.id, email: user.email, plan: user.plan },
-    process.env.JWT_ACCESS_SECRET || "access",
-    { expiresIn: asExpires(process.env.JWT_ACCESS_EXPIRES, "1440m") },
-  );
-
-  const refresh = signJwt({ id: user.id }, process.env.JWT_REFRESH_SECRET || "refresh", {
-    expiresIn: asExpires(process.env.JWT_REFRESH_EXPIRES, "7d"),
-  });
-
-  setAuthCookies(res, access, refresh);
-
-  // merge guest diagrams if allowed by plan
   try {
-    const aid = req.signedCookies?.aid as string | undefined;
-    if (aid) {
-      await mergeGuestDiagramsToUser(aid, user.id, user.plan as "free" | "pro");
-      res.clearCookie("aid", { path: "/" });
-    }
-  } catch (e) {
-    console.error("[register] mergeGuestDiagramsToUser failed:", e);
-  }
+    const user = await UserModel.create({
+      firstName,
+      lastName,
+      email, // ✅ stored lowercased
+      passwordHash: hashed,
+      plan: "free",
+    });
 
-  return res.status(201).json(
-    ok({
-      user: {
-        id: user.id,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        email: user.email,
-        plan: user.plan,
-      },
-      tokens: { access, refresh },
-    }),
-  );
+    const access = signJwt(
+      { id: user.id, email: user.email, plan: user.plan },
+      process.env.JWT_ACCESS_SECRET || "access",
+      { expiresIn: asExpires(process.env.JWT_ACCESS_EXPIRES, ACCESS_EXPIRES) },
+    );
+
+    const refresh = signJwt({ id: user.id }, process.env.JWT_REFRESH_SECRET || "refresh", {
+      expiresIn: asExpires(process.env.JWT_REFRESH_EXPIRES, REFRESH_EXPIRES),
+    });
+
+    setAuthCookies(res, access, refresh);
+
+    try {
+      const aid = req.signedCookies?.aid as string | undefined;
+      if (aid) {
+        await mergeGuestDiagramsToUser(aid, user.id, user.plan as "free" | "pro");
+        res.clearCookie("aid", { path: "/" });
+      }
+    } catch {
+      /* best-effort */
+    }
+
+    return res.status(201).json(
+      ok({
+        user: {
+          id: user.id,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          email: user.email,
+          plan: user.plan,
+        },
+        tokens: { access, refresh },
+      }),
+    );
+  } catch (err: any) {
+    // ✅ defend against race between findOne and create
+    if (err && err.code === 11000) {
+      return res.status(409).json(fail("Email already registered", "EMAIL_TAKEN"));
+    }
+    throw err;
+  }
 }
 
 export async function login(req: Request, res: Response) {
   const { email, password } = req.body as { email: string; password: string };
-  const user = await UserModel.findOne({ email });
-  if (!user) return res.status(401).json(fail("Invalid credentials", "BAD_LOGIN"));
 
-  const match = await bcrypt.compare(password, user.password);
+  const user = await UserModel.findOne({ email }).select("+passwordHash");
+  if (!user || !user.passwordHash) {
+    return res.status(401).json(fail("Invalid credentials", "BAD_LOGIN"));
+  }
+  const match = await bcrypt.compare(password, user.passwordHash);
   if (!match) return res.status(401).json(fail("Invalid credentials", "BAD_LOGIN"));
+
+  user.lastLoginAt = new Date();
+  await user.save({ validateBeforeSave: false });
 
   const access = signJwt(
     { id: user.id, email: user.email, plan: user.plan },
     process.env.JWT_ACCESS_SECRET || "access",
-    { expiresIn: asExpires(process.env.JWT_ACCESS_EXPIRES, "15m") },
+    { expiresIn: ACCESS_EXPIRES },
   );
+
   const refresh = signJwt({ id: user.id }, process.env.JWT_REFRESH_SECRET || "refresh", {
-    expiresIn: asExpires(process.env.JWT_REFRESH_EXPIRES, "7d"),
+    expiresIn: REFRESH_EXPIRES,
   });
 
   setAuthCookies(res, access, refresh);
 
-  // merge guest diagrams if allowed by plan
   try {
     const aid = req.signedCookies?.aid as string | undefined;
     if (aid) {
       await mergeGuestDiagramsToUser(aid, user.id, user.plan as "free" | "pro");
       res.clearCookie("aid", { path: "/" });
     }
-  } catch (e) {
-    console.error("[login] mergeGuestDiagramsToUser failed:", e);
+  } catch {
+    // best-effort; ignore merge errors
   }
 
   return res.json(
-    ok({
-      user: { id: user.id, email: user.email, plan: user.plan },
-      tokens: { access, refresh },
-    }),
+    ok({ user: { id: user.id, email: user.email, plan: user.plan }, tokens: { access, refresh } }),
   );
 }
 
@@ -229,10 +134,9 @@ export async function me(req: Request, res: Response) {
   const newAccess = signJwt(
     { id: req.user.id, email: req.user.email, plan: req.user.plan },
     process.env.JWT_ACCESS_SECRET || "access",
-    { expiresIn: asExpires(process.env.JWT_ACCESS_EXPIRES, "120m") },
+    { expiresIn: ACCESS_EXPIRES },
   );
 
-  // refresh token remains as-is; rotate only access here
   setAuthCookies(res, newAccess);
   return res.json(ok({ user: req.user }));
 }
