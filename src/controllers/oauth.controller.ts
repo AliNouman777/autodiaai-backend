@@ -10,7 +10,6 @@ const ACCESS_EXPIRES: SignOptions["expiresIn"] =
 const REFRESH_EXPIRES: SignOptions["expiresIn"] =
   (process.env.JWT_REFRESH_EXPIRES as SignOptions["expiresIn"]) || "7d";
 
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
 function resolveSafeRedirect(frontendUrl: string, candidate?: string): string {
   try {
@@ -25,7 +24,7 @@ function resolveSafeRedirect(frontendUrl: string, candidate?: string): string {
 export async function finalizeGoogleCallback(req: Request, res: Response) {
   const u = req.user as { id: string; email: string; plan?: "free" | "pro" };
   if (!u) {
-    return res.redirect(303, new URL("/auth/google/failure", FRONTEND_URL).toString());
+    return res.redirect(303, new URL("/auth/google/failure", process.env.FRONTEND_URL).toString());
   }
 
   const accessSecret = process.env.JWT_ACCESS_SECRET || "dev-access-secret";
@@ -51,7 +50,7 @@ export async function finalizeGoogleCallback(req: Request, res: Response) {
   }
 
   const nextParam = typeof req.query.state === "string" ? req.query.state : undefined;
-  const target = resolveSafeRedirect(FRONTEND_URL, nextParam);
+  const target = resolveSafeRedirect(process.env.FRONTEND_URL || "", nextParam);
   return res.redirect(303, target);
 }
 
