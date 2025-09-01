@@ -2,6 +2,7 @@
 import { Router } from "express";
 import { softAuth } from "../middlewares/softAuth";
 import { ensureAnonId } from "../middlewares/ensureAnonId";
+import { enforceIfLoggedIn } from "../middlewares/enforceIfLoggedIn"; // ⬅️ add this
 import {
   createDiagram,
   deleteDiagram,
@@ -27,7 +28,10 @@ router.use(ensureAnonId);
 /* --------------------------- Diagram CRUD --------------------------- */
 router.get("/diagrams", listMyDiagrams);
 router.get("/diagrams/:id", getDiagram);
-router.post("/diagrams", createDiagram);
+
+// Enforce 10-diagram cap for *logged-in free* users only
+router.post("/diagrams", enforceIfLoggedIn, createDiagram);
+
 router.patch("/diagrams/:id", updateDiagram);
 router.get("/diagrams/:id/export.sql", exportDiagramSql);
 router.delete("/diagrams/:id", deleteDiagram);

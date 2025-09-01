@@ -31,12 +31,12 @@ const UserSchema = new Schema<User, UserModelType>(
   {
     firstName: { type: String, trim: true },
     lastName: { type: String, trim: true },
-    email: { type: String, required: true, unique: true, index: true, trim: true, lowercase: true },
+    email: { type: String, required: true, unique: true, trim: true, lowercase: true },
     passwordHash: { type: String, select: false },
     plan: { type: String, enum: ["free", "pro"], default: "free" },
     credits: { type: Number, default: 50, min: 0 },
     providers: {
-      google: { type: String, index: true },
+      google: { type: String },
     },
     isEmailVerified: { type: Boolean, default: false },
     lastLoginAt: { type: Date },
@@ -45,7 +45,7 @@ const UserSchema = new Schema<User, UserModelType>(
 );
 
 // Index for provider lookups
-UserSchema.index({ "providers.google": 1 });
+UserSchema.index({ "providers.google": 1 }, { unique: true, sparse: true });
 
 function splitName(displayName?: string | null): { firstName?: string; lastName?: string } {
   if (!displayName) return {};
