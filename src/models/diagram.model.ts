@@ -24,6 +24,17 @@ const MODELS = [
   "deepseek/deepseek-chat-v3-0324:free",
 ] as const;
 
+// 1) Add under your other sub-schemas (Field/Node/Edge):
+
+const ChatMessageSchema = new Schema(
+  {
+    role: { type: String, enum: ["user", "assistant", "system"], required: true },
+    content: { type: String, required: true, trim: true },
+    ts: { type: Number, required: true }, // unix ms
+  },
+  { _id: false },
+);
+
 /** --- sub-schemas --- */
 const FieldSchema = new Schema(
   {
@@ -81,7 +92,8 @@ export interface DiagramAttrs {
   model: (typeof MODELS)[number];
   nodes: unknown[];
   edges: unknown[];
-  // timestamps are added at runtime; no need to include in the schema generic
+  version: number;
+  chat?: Array<{ role: "user" | "assistant" | "system"; content: string; ts: number }>; // NEW
 }
 
 /** Hydrated document type you’ll get from queries */
@@ -91,7 +103,7 @@ const DiagramSchema = new Schema<DiagramAttrs>(
   {
     userId: { type: Schema.Types.ObjectId, ref: "User", default: null, index: true },
     ownerAnonId: { type: String, default: null, index: true },
-
+    version: { type: Number, default: 0, index: true }, // ⬅️ default 0
     title: { type: String, default: "Untitled Diagram", trim: true },
     type: {
       type: String,
@@ -108,6 +120,7 @@ const DiagramSchema = new Schema<DiagramAttrs>(
     model: { type: String, enum: MODELS, default: "gemini-2.5-flash-lite", index: true },
     nodes: { type: [NodeSchema], default: [] },
     edges: { type: [EdgeSchema], default: [] },
+    chat: { type: [ChatMessageSchema], default: [] },
   },
   { timestamps: true },
 );
@@ -120,10 +133,11 @@ DiagramSchema.pre("validate", function (next) {
   next(new Error("Exactly one of userId or ownerAnonId must be set."));
 });
 
-// good indexes (remove the bad identityType one)
+// good indexes
+DiagramSchema.index({ _id: 1, "chat.ts": -1 });
 DiagramSchema.index({ userId: 1, updatedAt: -1 });
 DiagramSchema.index({ ownerAnonId: 1, updatedAt: -1 });
 
 /** The Model must be Model<DiagramAttrs>, NOT Model<DiagramDoc> */
-export  const DiagramModel: Model<DiagramAttrs> =
+export const DiagramModel: Model<DiagramAttrs> =
   (models.Diagram as Model<DiagramAttrs>) || model<DiagramAttrs>("Diagram", DiagramSchema);

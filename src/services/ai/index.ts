@@ -151,7 +151,6 @@ class GeminiProvider implements ERDProvider {
         model,
         generationConfig: {
           responseMimeType: "application/json",
-          temperature: 0,
           maxOutputTokens: 4000,
         },
         contents: [

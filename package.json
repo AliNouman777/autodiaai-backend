@@ -44,6 +44,7 @@
     "passport-google-oidc": "^0.1.0",
     "pino": "^9.8.0",
     "pino-http": "^10.5.0",
+    "redlock": "^5.0.0-beta.2",
     "zod": "^3.25.76"
   },
   "devDependencies": {
