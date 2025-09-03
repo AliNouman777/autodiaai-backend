@@ -11,6 +11,7 @@ const aiCacheSchema = new Schema(
       title: String,
       nodes: { type: [Schema.Types.Mixed], default: [] },
       edges: { type: [Schema.Types.Mixed], default: [] },
+      message: String,
     },
   },
   { timestamps: true },

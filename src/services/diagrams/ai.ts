@@ -1,7 +1,8 @@
+// src/services/diagrams/ai.ts
 import * as nodeCrypto from "node:crypto";
 import aicacheModel from "../../models/aicache.model";
 import { normalizeErd } from "../../schemas/erd-ai";
-import { getProviderFor, type CanonicalModel } from "../../services/ai";
+import { getProviderFor, type CanonicalModel } from "../ai";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -38,29 +39,15 @@ async function withTimeout<T>(p: Promise<T>, ms = 180000) {
   }
 }
 
+/**
+ * Gemini-only execution. Returns:
+ *  - { nodes, edges, message? } OR
+ *  - { ops, message? }
+ */
 export async function hedgedGenerate(prompt: string, primary: CanonicalModel) {
-  const fast: CanonicalModel[] =
-    primary === "gpt-5-mini" || primary === "gemini-2.5-flash-lite"
-      ? [primary, primary === "gpt-5-mini" ? "gemini-2.5-flash-lite" : "gpt-5-mini"]
-      : [primary];
-
-  const run = (m: CanonicalModel, delayMs = 0) =>
-    new Promise<any>((resolve, reject) =>
-      setTimeout(async () => {
-        try {
-          resolve(await getProviderFor(m).generate(prompt, m));
-        } catch (e) {
-          reject(e);
-        }
-      }, delayMs),
-    );
-
-  try {
-    if (fast.length === 2) return await Promise.any([run(fast[0], 0), run(fast[1], 1200)]);
-    return await run(fast[0], 0);
-  } catch {
-    return await getProviderFor("gpt-5").generate(prompt, "gpt-5");
-  }
+  const provider = getProviderFor(primary);
+  const run = () => provider.generate(prompt, primary);
+  return withTimeout(withRetry(run));
 }
 
 /* ---- cache helper (legacy full ERD) ---- */
@@ -70,6 +57,10 @@ function makeKey(model: string, prompt: string, diagramVersion?: number) {
   return `${model}${v}::` + nodeCrypto.createHash("sha256").update(norm).digest("hex");
 }
 
+/**
+ * Legacy full-ERD path with aicache.
+ * Keeps behavior but now only uses Gemini under the hood.
+ */
 export async function generateFromPrompt({
   prompt,
   model,
@@ -96,6 +87,7 @@ export async function generateFromPrompt({
       edges: strict.edges,
       prompt,
       model,
+      message: payload?.message, // if you ever cached it
     };
   }
 
@@ -105,6 +97,7 @@ export async function generateFromPrompt({
     title: titleOverride || "Untitled Diagram",
     nodes: strict.nodes,
     edges: strict.edges,
+    message: result.message,
   };
 
   await aicacheModel.create({ key, raw: JSON.stringify(out), payload: out });

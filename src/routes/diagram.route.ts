@@ -13,7 +13,6 @@ import {
   addNodeField,
   updateNodeField,
   deleteNodeField,
-  reorderNodeFields,
   updateNodeLabel,
 } from "../controllers/diagram.controller";
 
@@ -38,7 +37,6 @@ router.delete("/diagrams/:id", deleteDiagram);
 
 /* ------------------------ Node Schema (fields) ----------------------- */
 router.patch("/diagrams/:id/nodes/:nodeId/label", updateNodeLabel);
-router.patch("/diagrams/:id/nodes/:nodeId/schema/reorder", reorderNodeFields);
 router.post("/diagrams/:id/nodes/:nodeId/schema", addNodeField);
 router.patch("/diagrams/:id/nodes/:nodeId/schema/:fieldId", updateNodeField);
 router.delete("/diagrams/:id/nodes/:nodeId/schema/:fieldId", deleteNodeField);

@@ -1,3 +1,4 @@
+// src/controllers/diagram.controller.ts
 import type { NextFunction, Request, Response } from "express";
 import { Types } from "mongoose";
 import { ok, fail } from "../utils/http";
@@ -6,12 +7,11 @@ import {
   CreateDiagramReq,
   FieldCreateReq,
   FieldDeleteReq,
-  FieldReorderReq,
   FieldUpdateReq,
   NodeLabelUpdateReq,
   UpdateDiagramReq,
 } from "../schemas/diagram.schema";
-import { normalizeErd, ZErdStrict } from "../schemas/erd-ai";
+import { normalizeErd } from "../schemas/erd-ai";
 import { isValidErd } from "../libs/isValidErd";
 import { getOwnerFilter } from "../services/diagrams/owner";
 import { composePrompt, tailForPrompt } from "../services/diagrams/prompt";
@@ -28,6 +28,45 @@ import { buildSqlExport } from "../services/diagrams/sql";
 /* ---------------------------- chat types ---------------------------- */
 type ChatRole = "user" | "assistant" | "system";
 type ChatMessage = { role: ChatRole; content: string; ts: number };
+
+/* ---------------------- assistant message helper --------------------- */
+function buildAssistantSummary({
+  nodes,
+  edges,
+  prompt,
+}: {
+  nodes: any[];
+  edges: any[];
+  prompt: string;
+}) {
+  const tableNames = nodes.map((n: any) => n?.data?.label || n?.id).filter(Boolean);
+  const relCount = edges.length;
+  const fieldsPerTable = nodes.map((n: any) => ({
+    table: n?.data?.label || n?.id,
+    fields: (n?.data?.schema ?? []).length,
+    pks: (n?.data?.schema ?? []).filter((f: any) => f.key === "PK").length,
+    fks: (n?.data?.schema ?? []).filter((f: any) => f.key === "FK").length,
+  }));
+
+  const top = tableNames.slice(0, 5).join(", ") + (tableNames.length > 5 ? "…" : "");
+  const lines: string[] = [];
+  lines.push(`Here’s the ERD based on your request:`);
+  if (prompt?.trim()) lines.push(`> "${prompt.trim()}"`);
+  lines.push("");
+  lines.push(`• Tables: ${nodes.length}${tableNames.length ? ` — ${top}` : ""}`);
+  lines.push(`• Relationships: ${relCount}`);
+  lines.push(
+    ...fieldsPerTable
+      .slice(0, 5)
+      .map(
+        (r) => `  - ${r.table}: ${r.fields} fields (PK:${r.pks}${r.fks ? `, FK:${r.fks}` : ""})`,
+      ),
+  );
+  if (fieldsPerTable.length > 5) lines.push(`  - …and ${fieldsPerTable.length - 5} more tables`);
+  lines.push("");
+  lines.push(`You can ask me to rename tables/fields, add columns, or change relationships.`);
+  return lines.join("\n");
+}
 
 /* ============================= CRUD ============================= */
 
@@ -167,7 +206,7 @@ export async function updateDiagram(req: Request, res: Response) {
     if (typeof title === "string" && title.trim()) updates.title = title.trim();
     if (typeof type === "string") updates.type = type;
 
-    // Manual nodes/edges
+    // Manual nodes/edges path
     if (Array.isArray(nodes) || Array.isArray(edges)) {
       const input = {
         nodes: Array.isArray(nodes) ? nodes : (existing.nodes as any[]),
@@ -193,7 +232,7 @@ export async function updateDiagram(req: Request, res: Response) {
           .json(fail("Your prompt does not seem ERD-related.", "INVALID_ERD_PROMPT"));
       }
 
-      const chosenModel = (model || (existing as any).model) as any;
+      const chosenModel = (model || (existing as any).model || "gemini-2.5-flash-lite") as any;
       const baseVersion =
         typeof clientVersion === "number" ? clientVersion : (existing.version ?? 0);
 
@@ -203,12 +242,9 @@ export async function updateDiagram(req: Request, res: Response) {
 
       const now = Date.now();
       const userMsg: ChatMessage = { role: "user", content: prompt.trim(), ts: now };
-      const ackMsg: ChatMessage = {
-        role: "assistant",
-        content: "Got it. Generating your ERD… You can refine with another message.",
-        ts: now + 1,
-      };
-      const workingChat: ChatMessage[] = [...prevChat, userMsg, ackMsg].slice(-100);
+
+      // ❌ Do NOT append a static ack; rely on frontend spinner instead
+      const workingChat: ChatMessage[] = [...prevChat, userMsg].slice(-100);
 
       const chatTail = tailForPrompt(workingChat, 6);
       const composed = composePrompt(
@@ -219,8 +255,10 @@ export async function updateDiagram(req: Request, res: Response) {
 
       let nextNodes: any[] = [];
       let nextEdges: any[] = [];
+      let assistantMessage: string | undefined;
 
       try {
+        // ai can be {nodes, edges, message?} or {ops, message?}
         const ai = await hedgedGenerate(composed, chosenModel);
 
         if (Array.isArray(ai?.ops)) {
@@ -240,6 +278,16 @@ export async function updateDiagram(req: Request, res: Response) {
           nextEdges = strict.edges;
         }
 
+        // Build a human-readable assistant message (fallback if provider doesn't supply one)
+        assistantMessage =
+          (ai as any)?.message ||
+          buildAssistantSummary({ nodes: nextNodes, edges: nextEdges, prompt: prompt.trim() });
+
+        const finalChat = [
+          ...workingChat,
+          { role: "assistant", content: assistantMessage, ts: Date.now() },
+        ].slice(-100);
+
         const doc = await DiagramModel.findOneAndUpdate(
           { _id: existing._id, version: baseVersion },
           {
@@ -250,7 +298,7 @@ export async function updateDiagram(req: Request, res: Response) {
               edges: nextEdges,
               prompt: prompt.trim(),
               model: chosenModel,
-              chat: workingChat,
+              chat: finalChat,
             },
             $inc: { version: 1 },
           },
@@ -322,11 +370,9 @@ export async function exportDiagramSql(req: Request, res: Response) {
     const out = await buildSqlExport(req);
 
     if (out.error) {
-      // out is SqlExportError here (narrowed by discriminator)
       return res.status(out.status).json(fail(out.message, out.code));
     }
 
-    // out is SqlExportSuccess here
     res.setHeader("Content-Type", out.contentType);
     res.setHeader("Content-Disposition", out.disposition);
     res.send(out.body);
@@ -436,34 +482,6 @@ export async function deleteNodeField(req: Request, res: Response) {
   }
 
   removeEdgesTouchingField(diagram as any, fieldId);
-  diagram.markModified("nodes");
-  await diagram.save();
-  return res.json(ok(diagram));
-}
-
-export async function reorderNodeFields(req: Request, res: Response) {
-  const parsed = FieldReorderReq.safeParse({ params: req.params, body: req.body });
-  if (!parsed.success)
-    return res.status(400).json(fail("Invalid reorder payload", "VALIDATION_ERROR"));
-
-  const { id, nodeId } = parsed.data.params;
-  const { order } = parsed.data.body;
-
-  const loaded = await loadDiagramWithNode(req, id, nodeId);
-  if ("error" in loaded) return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
-  const { diagram, node } = loaded;
-
-  const byId = new Map(node.data!.schema.map((f: any) => [f.id, f]));
-  const reordered: any[] = [];
-  for (const fid of order) {
-    const f = byId.get(fid);
-    if (f) reordered.push(f);
-  }
-  for (const f of node.data!.schema) {
-    if (!order.includes(f.id)) reordered.push(f);
-  }
-
-  node.data!.schema = reordered;
   diagram.markModified("nodes");
   await diagram.save();
   return res.json(ok(diagram));
