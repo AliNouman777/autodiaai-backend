@@ -69,12 +69,24 @@ export function createServer() {
       },
       credentials: true,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type", "Authorization"],
+      allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Accept"],
       optionsSuccessStatus: 204,
     }),
   );
 
-  app.use(compression());
+  // Compression - exclude streaming endpoints
+  app.use(
+    compression({
+      filter: (req, res) => {
+        // Don't compress streaming endpoints
+        if (req.url?.includes("/stream")) {
+          return false;
+        }
+        // Use default compression filter for other requests
+        return compression.filter(req, res);
+      },
+    }),
+  );
   app.use(express.json({ limit: "1mb" }));
   app.use(express.urlencoded({ extended: true }));
 

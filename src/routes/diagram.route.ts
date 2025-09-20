@@ -10,6 +10,7 @@ import {
   getDiagram,
   listMyDiagrams,
   updateDiagram,
+  updateDiagramStream,
   addNodeField,
   updateNodeField,
   deleteNodeField,
@@ -32,6 +33,7 @@ router.get("/diagrams/:id", getDiagram);
 router.post("/diagrams", enforceIfLoggedIn, createDiagram);
 
 router.patch("/diagrams/:id", updateDiagram);
+router.patch("/diagrams/:id/stream", updateDiagramStream);
 router.get("/diagrams/:id/export.sql", exportDiagramSql);
 router.delete("/diagrams/:id", deleteDiagram);
 

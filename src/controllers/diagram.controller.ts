@@ -21,7 +21,7 @@ import {
   rewriteHandlesForFieldRename,
   removeEdgesTouchingField,
 } from "../services/diagrams/ops";
-import { hedgedGenerate } from "../services/diagrams/ai";
+import { hedgedGenerate, hedgedGenerateStream } from "../services/diagrams/ai";
 import { loadDiagramWithNode } from "../services/diagrams/node-loader";
 import { buildSqlExport } from "../services/diagrams/sql";
 
@@ -503,4 +503,387 @@ export async function updateNodeLabel(req: Request, res: Response) {
   diagram.markModified("nodes");
   await diagram.save();
   return res.json(ok(diagram));
+}
+
+/* --------------------- STREAMING UPDATE (chat integrated) --------------------- */
+
+export async function updateDiagramStream(req: Request, res: Response) {
+  if (!UpdateDiagramReq || typeof (UpdateDiagramReq as any).safeParse !== "function") {
+    console.error("[DiagramCtrl] UpdateDiagramReq missing/invalid");
+    return res.status(500).json(fail("Server schema not loaded", "SERVER_CONFIG"));
+  }
+  const parsed = UpdateDiagramReq.safeParse({ params: req.params, body: req.body });
+  if (!parsed.success) return res.status(400).json(fail("Invalid update", "VALIDATION_ERROR"));
+
+  const { id } = parsed.data.params;
+  const { title, type, nodes, edges, prompt, model } = parsed.data.body as any;
+  const clientVersion: number | undefined = (parsed.data.body as any).version;
+
+  try {
+    if (!Types.ObjectId.isValid(id)) {
+      return res.status(400).json(fail("Invalid diagram id", "BAD_ID"));
+    }
+
+    const owner = getOwnerFilter(req);
+    const existing = await DiagramModel.findOne({ _id: new Types.ObjectId(id), ...owner });
+    if (!existing) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
+
+    // Manual nodes/edges path - not supported in streaming
+    if (Array.isArray(nodes) || Array.isArray(edges)) {
+      return res
+        .status(400)
+        .json(fail("Manual updates not supported in streaming mode", "NOT_SUPPORTED"));
+    }
+
+    // AI generation path
+    if (prompt && prompt.trim()) {
+      if (!isValidErd(prompt)) {
+        return res
+          .status(400)
+          .json(fail("Your prompt does not seem ERD-related.", "INVALID_ERD_PROMPT"));
+      }
+
+      const chosenModel = (model || (existing as any).model || "gemini-2.5-flash-lite") as any;
+      const baseVersion =
+        typeof clientVersion === "number" ? clientVersion : (existing.version ?? 0);
+
+      const prevChat: ChatMessage[] = Array.isArray((existing as any).chat)
+        ? ((existing as any).chat as ChatMessage[])
+        : [];
+
+      const now = Date.now();
+      const userMsg: ChatMessage = { role: "user", content: prompt.trim(), ts: now };
+      const workingChat: ChatMessage[] = [...prevChat, userMsg].slice(-100);
+
+      const chatTail = tailForPrompt(workingChat, 6);
+      const composed = composePrompt(
+        (existing as any).toObject ? (existing as any).toObject() : existing,
+        prompt,
+        chatTail,
+      );
+
+      // Check if client wants streaming (Accept header or query param)
+      const wantsStreaming =
+        req.headers.accept?.includes("text/event-stream") || req.query.stream === "true";
+
+      if (wantsStreaming) {
+        // Set up Server-Sent Events
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
+        res.setHeader(
+          "Access-Control-Allow-Headers",
+          "Content-Type, Authorization, Cache-Control, Accept",
+        );
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+        res.setHeader("Access-Control-Allow-Credentials", "true");
+
+        const sendSSE = (data: any) => {
+          try {
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+          } catch (error) {
+            console.log("Client disconnected, stopping stream");
+            throw error;
+          }
+        };
+
+        // Handle client disconnect
+        req.on("close", () => {
+          console.log("Client disconnected from streaming endpoint");
+        });
+
+        try {
+          sendSSE({ type: "start", message: "Starting AI generation..." });
+
+          let nextNodes: any[] = [];
+          let nextEdges: any[] = [];
+          let assistantMessage: string | undefined;
+          let isComplete = false;
+
+          // Start heartbeat to keep connection alive
+          const heartbeatInterval = setInterval(() => {
+            if (!isComplete) {
+              sendSSE({ type: "heartbeat", data: { timestamp: Date.now() } });
+            }
+          }, 5000); // Send heartbeat every 5 seconds
+
+          try {
+            for await (const chunk of hedgedGenerateStream(composed, chosenModel)) {
+              if (chunk.type === "progress") {
+                sendSSE({ type: "progress", data: chunk.data });
+              } else if (chunk.type === "partial") {
+                sendSSE({ type: "partial", data: chunk.data });
+              } else if (chunk.type === "heartbeat") {
+                sendSSE({ type: "heartbeat", data: chunk.data });
+              } else if (chunk.type === "complete") {
+                isComplete = true;
+                clearInterval(heartbeatInterval);
+
+                if (chunk.error) {
+                  sendSSE({ type: "error", error: chunk.error });
+                  res.end();
+                  return;
+                }
+
+                const ai = chunk.data as any;
+                if (Array.isArray(ai?.ops)) {
+                  const normalizedOps = ai.ops.map((o: any) =>
+                    o?.op === "add_field" ? { ...o, key: toCanonicalKey(o.key) } : o,
+                  );
+                  const applied = applyOpsInMemory(
+                    (existing as any).toObject ? (existing as any).toObject() : existing,
+                    normalizedOps,
+                  );
+                  const strict = normalizeErd(applied);
+                  nextNodes = strict.nodes;
+                  nextEdges = strict.edges;
+                } else {
+                  const strict = normalizeErd({ nodes: ai?.nodes ?? [], edges: ai?.edges ?? [] });
+                  nextNodes = strict.nodes;
+                  nextEdges = strict.edges;
+                }
+
+                assistantMessage =
+                  ai?.message ||
+                  buildAssistantSummary({
+                    nodes: nextNodes,
+                    edges: nextEdges,
+                    prompt: prompt.trim(),
+                  });
+
+                const finalChat = [
+                  ...workingChat,
+                  { role: "assistant", content: assistantMessage, ts: Date.now() },
+                ].slice(-100);
+
+                const doc = await DiagramModel.findOneAndUpdate(
+                  { _id: existing._id, version: baseVersion },
+                  {
+                    $set: {
+                      ...(title ? { title: title.trim() } : {}),
+                      ...(type ? { type } : {}),
+                      nodes: nextNodes,
+                      edges: nextEdges,
+                      prompt: prompt.trim(),
+                      model: chosenModel,
+                      chat: finalChat,
+                    },
+                    $inc: { version: 1 },
+                  },
+                  { new: true },
+                ).lean();
+
+                if (!doc) {
+                  sendSSE({ type: "error", error: "Version conflict" });
+                  res.end();
+                  return;
+                }
+
+                sendSSE({ type: "complete", data: doc });
+                res.end();
+                return;
+              }
+            }
+          } finally {
+            clearInterval(heartbeatInterval);
+          }
+        } catch (err: any) {
+          console.error("[updateDiagramStream:AI] error:", err);
+          let errMsg = err?.message || "AI generation failed";
+
+          // Provide more helpful error messages for common issues
+          if (errMsg.includes("Invalid diagram JSON")) {
+            errMsg =
+              "The AI generated an invalid diagram structure. Please try again with a different prompt.";
+          } else if (errMsg.includes("Empty response")) {
+            errMsg = "The AI didn't generate any content. Please try again.";
+          } else if (errMsg.includes("timeout")) {
+            errMsg = "The AI request timed out. Please try again.";
+          } else if (errMsg.includes("quota") || errMsg.includes("429")) {
+            errMsg = "AI service quota exceeded. Please try again later.";
+          }
+
+          const finalChat = [
+            ...workingChat,
+            { role: "assistant", content: `There was an error: ${errMsg}`, ts: Date.now() },
+          ].slice(-100);
+
+          await DiagramModel.findOneAndUpdate(
+            { _id: existing._id, version: baseVersion },
+            {
+              $set: {
+                ...(title ? { title: title.trim() } : {}),
+                ...(type ? { type } : {}),
+                prompt: prompt.trim(),
+                model: chosenModel,
+                chat: finalChat,
+              },
+              $inc: { version: 1 },
+            },
+            { new: true },
+          )
+            .lean()
+            .catch(() => {});
+
+          sendSSE({ type: "error", error: errMsg });
+          res.end();
+          return;
+        }
+      } else {
+        // Regular JSON response - collect all streaming data and return at once
+        try {
+          let nextNodes: any[] = [];
+          let nextEdges: any[] = [];
+          let assistantMessage: string | undefined;
+          let hasError = false;
+          let errorMessage = "";
+
+          for await (const chunk of hedgedGenerateStream(composed, chosenModel)) {
+            if (chunk.type === "complete") {
+              if (chunk.error) {
+                hasError = true;
+                errorMessage = chunk.error;
+                break;
+              }
+
+              const ai = chunk.data as any;
+              if (Array.isArray(ai?.ops)) {
+                const normalizedOps = ai.ops.map((o: any) =>
+                  o?.op === "add_field" ? { ...o, key: toCanonicalKey(o.key) } : o,
+                );
+                const applied = applyOpsInMemory(
+                  (existing as any).toObject ? (existing as any).toObject() : existing,
+                  normalizedOps,
+                );
+                const strict = normalizeErd(applied);
+                nextNodes = strict.nodes;
+                nextEdges = strict.edges;
+              } else {
+                const strict = normalizeErd({ nodes: ai?.nodes ?? [], edges: ai?.edges ?? [] });
+                nextNodes = strict.nodes;
+                nextEdges = strict.edges;
+              }
+
+              assistantMessage =
+                ai?.message ||
+                buildAssistantSummary({
+                  nodes: nextNodes,
+                  edges: nextEdges,
+                  prompt: prompt.trim(),
+                });
+              break;
+            }
+          }
+
+          if (hasError) {
+            const finalChat = [
+              ...workingChat,
+              { role: "assistant", content: `There was an error: ${errorMessage}`, ts: Date.now() },
+            ].slice(-100);
+
+            await DiagramModel.findOneAndUpdate(
+              { _id: existing._id, version: baseVersion },
+              {
+                $set: {
+                  ...(title ? { title: title.trim() } : {}),
+                  ...(type ? { type } : {}),
+                  prompt: prompt.trim(),
+                  model: chosenModel,
+                  chat: finalChat,
+                },
+                $inc: { version: 1 },
+              },
+              { new: true },
+            )
+              .lean()
+              .catch(() => {});
+
+            return res.status(502).json(fail(errorMessage, "AI_FAILED"));
+          }
+
+          const finalChat = [
+            ...workingChat,
+            { role: "assistant", content: assistantMessage, ts: Date.now() },
+          ].slice(-100);
+
+          const doc = await DiagramModel.findOneAndUpdate(
+            { _id: existing._id, version: baseVersion },
+            {
+              $set: {
+                ...(title ? { title: title.trim() } : {}),
+                ...(type ? { type } : {}),
+                nodes: nextNodes,
+                edges: nextEdges,
+                prompt: prompt.trim(),
+                model: chosenModel,
+                chat: finalChat,
+              },
+              $inc: { version: 1 },
+            },
+            { new: true },
+          ).lean();
+
+          if (!doc) return res.status(409).json(fail("Version conflict", "CONFLICT"));
+          return res.json(ok(doc));
+        } catch (err: any) {
+          console.error("[updateDiagramStream:AI] error:", err);
+          let errMsg = err?.message || "AI generation failed";
+
+          // Provide more helpful error messages for common issues
+          if (errMsg.includes("Invalid diagram JSON")) {
+            errMsg =
+              "The AI generated an invalid diagram structure. Please try again with a different prompt.";
+          } else if (errMsg.includes("Empty response")) {
+            errMsg = "The AI didn't generate any content. Please try again.";
+          } else if (errMsg.includes("timeout")) {
+            errMsg = "The AI request timed out. Please try again.";
+          } else if (errMsg.includes("quota") || errMsg.includes("429")) {
+            errMsg = "AI service quota exceeded. Please try again later.";
+          }
+
+          const finalChat = [
+            ...workingChat,
+            { role: "assistant", content: `There was an error: ${errMsg}`, ts: Date.now() },
+          ].slice(-100);
+
+          await DiagramModel.findOneAndUpdate(
+            { _id: existing._id, version: baseVersion },
+            {
+              $set: {
+                ...(title ? { title: title.trim() } : {}),
+                ...(type ? { type } : {}),
+                prompt: prompt.trim(),
+                model: chosenModel,
+                chat: finalChat,
+              },
+              $inc: { version: 1 },
+            },
+            { new: true },
+          )
+            .lean()
+            .catch(() => {});
+
+          if (errMsg.includes("429") || /quota/i.test(errMsg)) {
+            return res.status(429).json(fail(errMsg, "AI_QUOTA_EXCEEDED"));
+          }
+          if (err?.response?.status) {
+            return res.status(err.response.status).json(fail(errMsg, "AI_FAILED"));
+          }
+          return res.status(502).json(fail(errMsg, "AI_FAILED"));
+        }
+      }
+    }
+
+    // If no prompt, return existing diagram
+    if (prompt && prompt.trim()) {
+      // This case is handled above in the AI generation path
+    } else {
+      // For non-AI updates, return regular JSON response
+      return res.json(ok((existing as any).toObject ? (existing as any).toObject() : existing));
+    }
+  } catch (err) {
+    console.error("[updateDiagramStream] error:", err);
+    res.status(500).json(fail("Failed to update diagram", "SERVER_ERROR"));
+  }
 }

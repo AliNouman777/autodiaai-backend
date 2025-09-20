@@ -2,7 +2,7 @@
 import * as nodeCrypto from "node:crypto";
 import aicacheModel from "../../models/aicache.model";
 import { normalizeErd } from "../../schemas/erd-ai";
-import { getProviderFor, type CanonicalModel } from "../ai";
+import { getProviderFor, generateERDStream, type CanonicalModel } from "../ai";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -48,6 +48,13 @@ export async function hedgedGenerate(prompt: string, primary: CanonicalModel) {
   const provider = getProviderFor(primary);
   const run = () => provider.generate(prompt, primary);
   return withTimeout(withRetry(run));
+}
+
+/**
+ * Streaming version of hedgedGenerate
+ */
+export function hedgedGenerateStream(prompt: string, primary: CanonicalModel) {
+  return generateERDStream(prompt, primary);
 }
 
 /* ---- cache helper (legacy full ERD) ---- */

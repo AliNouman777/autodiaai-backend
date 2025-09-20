@@ -76,4 +76,8 @@ Auto-generate reasonable fields like created_at/updated_at (TIMESTAMP) but do no
 - Output pure JSON with keys "nodes" and "edges"
 - No markdown, no extra text, no explanations
 - Never truncate — include all nodes & edges completely
+- Every field in schema MUST have: id, title, type (all required)
+- Every node MUST have: id, type, position, data with label and schema
+- Every edge MUST have: id, source, target, type, sourceHandle, targetHandle
+- Validate your JSON before outputting - ensure all required fields are present
 `;
