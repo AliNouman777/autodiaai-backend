@@ -9,7 +9,6 @@ import {
   exportDiagramSql,
   getDiagram,
   listMyDiagrams,
-  updateDiagram,
   updateDiagramStream,
   addNodeField,
   updateNodeField,
@@ -32,7 +31,6 @@ router.get("/diagrams/:id", getDiagram);
 // Enforce 10-diagram cap for *logged-in free* users only
 router.post("/diagrams", enforceIfLoggedIn, createDiagram);
 
-router.patch("/diagrams/:id", updateDiagram);
 router.patch("/diagrams/:id/stream", updateDiagramStream);
 router.get("/diagrams/:id/export.sql", exportDiagramSql);
 router.delete("/diagrams/:id", deleteDiagram);

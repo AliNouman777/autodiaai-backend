@@ -1,8 +1,17 @@
-// src/controllers/diagram.controller.ts
+/**
+ * Diagram Controller - Production-level diagram management
+ *
+ * This module handles all diagram CRUD operations, AI generation, and streaming updates.
+ * It provides comprehensive error handling, input validation, and logging.
+ *
+ * @author AutoDiaAI Team
+ * @version 2.0.0
+ */
+
 import type { NextFunction, Request, Response } from "express";
 import { Types } from "mongoose";
 import { ok, fail } from "../utils/http";
-import { DiagramModel } from "../models/diagram.model";
+import { DiagramModel, type DiagramDoc } from "../models/diagram.model";
 import {
   CreateDiagramReq,
   FieldCreateReq,
@@ -24,12 +33,208 @@ import {
 import { hedgedGenerate, hedgedGenerateStream } from "../services/diagrams/ai";
 import { loadDiagramWithNode } from "../services/diagrams/node-loader";
 import { buildSqlExport } from "../services/diagrams/sql";
+import logger from "../libs/logger";
 
-/* ---------------------------- chat types ---------------------------- */
+/* ============================= CONSTANTS ============================= */
+
+/** Default AI model for diagram generation */
+const DEFAULT_MODEL = "gemini-2.5-flash-lite" as const;
+
+/** Maximum number of diagrams for guest users */
+const GUEST_DIAGRAM_LIMIT = 4;
+
+/** Maximum number of diagrams for free plan users */
+const FREE_PLAN_DIAGRAM_LIMIT = 10;
+
+/** Maximum chat history to keep */
+const MAX_CHAT_HISTORY = 100;
+
+/** Maximum chat tail for prompt composition */
+const MAX_CHAT_TAIL = 6;
+
+/** Heartbeat interval for streaming connections (ms) */
+const HEARTBEAT_INTERVAL = 5000;
+
+/** Request timeout for AI generation (ms) */
+const AI_GENERATION_TIMEOUT = 180000;
+
+/* ============================= TYPES ============================= */
+
+/** Chat message roles */
 type ChatRole = "user" | "assistant" | "system";
-type ChatMessage = { role: ChatRole; content: string; ts: number };
 
-/* ---------------------- assistant message helper --------------------- */
+/** Chat message structure */
+interface ChatMessage {
+  role: ChatRole;
+  content: string;
+  ts: number;
+}
+
+/** AI generation result */
+interface AIGenerationResult {
+  nodes?: any[];
+  edges?: any[];
+  ops?: any[];
+  message?: string;
+}
+
+/** Streaming chunk types */
+interface StreamingChunk {
+  type: "progress" | "partial" | "heartbeat" | "complete";
+  data?: any;
+  error?: string;
+}
+
+/** Diagram update parameters */
+interface DiagramUpdateParams {
+  id: string;
+  title?: string;
+  type?: string;
+  nodes?: any[];
+  edges?: any[];
+  prompt?: string;
+  model?: string;
+  version?: number;
+}
+
+/** Error context for logging */
+interface ErrorContext {
+  operation: string;
+  userId?: string;
+  diagramId?: string;
+  additionalInfo?: Record<string, any>;
+}
+
+/* ============================= UTILITY FUNCTIONS ============================= */
+
+/**
+ * Enhanced error logging with context
+ */
+function logError(error: any, context: ErrorContext): void {
+  const logData = {
+    error: error?.message || "Unknown error",
+    stack: error?.stack,
+    operation: context.operation,
+    userId: context.userId,
+    diagramId: context.diagramId,
+    ...context.additionalInfo,
+  };
+
+  logger.error(logData, `[${context.operation}] Error occurred`);
+}
+
+/**
+ * Enhanced success logging with context
+ */
+function logSuccess(message: string, context: Partial<ErrorContext>): void {
+  const logData = {
+    operation: context.operation,
+    userId: context.userId,
+    diagramId: context.diagramId,
+    ...context.additionalInfo,
+  };
+
+  logger.info(logData, message);
+}
+
+/**
+ * Validates ObjectId format
+ */
+function isValidObjectId(id: string): boolean {
+  return Types.ObjectId.isValid(id);
+}
+
+/**
+ * Sanitizes user input by trimming strings
+ */
+function sanitizeInput(input: any): any {
+  if (typeof input === "string") {
+    return input.trim();
+  }
+  if (Array.isArray(input)) {
+    return input.map(sanitizeInput);
+  }
+  if (input && typeof input === "object") {
+    const sanitized: any = {};
+    for (const [key, value] of Object.entries(input)) {
+      sanitized[key] = sanitizeInput(value);
+    }
+    return sanitized;
+  }
+  return input;
+}
+
+/**
+ * Normalizes error messages for better user experience
+ */
+function normalizeErrorMessage(error: any): string {
+  const message = error?.message || "An unexpected error occurred";
+
+  // Map common error patterns to user-friendly messages
+  if (message.includes("Invalid diagram JSON")) {
+    return "The AI generated an invalid diagram structure. Please try again with a different prompt.";
+  }
+  if (message.includes("Empty response")) {
+    return "The AI didn't generate any content. Please try again.";
+  }
+  if (message.includes("timeout")) {
+    return "The AI request timed out. Please try again.";
+  }
+  if (message.includes("quota") || message.includes("429")) {
+    return "AI service quota exceeded. Please try again later.";
+  }
+  if (message.includes("Version conflict")) {
+    return "The diagram was modified by another session. Please refresh and try again.";
+  }
+
+  return message;
+}
+
+/**
+ * Determines if the request wants streaming response
+ */
+function wantsStreaming(req: Request): boolean {
+  return req.headers.accept?.includes("text/event-stream") || req.query.stream === "true";
+}
+
+/**
+ * Sets up Server-Sent Events headers
+ */
+function setupSSEHeaders(res: Response, req: Request): void {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, Cache-Control, Accept",
+  );
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+}
+
+/**
+ * Creates a safe SSE sender that handles client disconnections
+ */
+function createSSESender(res: Response) {
+  return (data: any): void => {
+    try {
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch (error) {
+      logger.info("Client disconnected, stopping stream");
+      throw error;
+    }
+  };
+}
+
+/* ============================= HELPER FUNCTIONS ============================= */
+
+/**
+ * Builds a comprehensive assistant summary for diagram generation results
+ *
+ * @param params - Summary parameters
+ * @returns Formatted summary string
+ */
 function buildAssistantSummary({
   nodes,
   edges,
@@ -38,93 +243,312 @@ function buildAssistantSummary({
   nodes: any[];
   edges: any[];
   prompt: string;
-}) {
-  const tableNames = nodes.map((n: any) => n?.data?.label || n?.id).filter(Boolean);
-  const relCount = edges.length;
-  const fieldsPerTable = nodes.map((n: any) => ({
-    table: n?.data?.label || n?.id,
-    fields: (n?.data?.schema ?? []).length,
-    pks: (n?.data?.schema ?? []).filter((f: any) => f.key === "PK").length,
-    fks: (n?.data?.schema ?? []).filter((f: any) => f.key === "FK").length,
-  }));
+}): string {
+  try {
+    const tableNames = nodes.map((n: any) => n?.data?.label || n?.id).filter(Boolean);
 
-  const top = tableNames.slice(0, 5).join(", ") + (tableNames.length > 5 ? "…" : "");
-  const lines: string[] = [];
-  lines.push(`Here’s the ERD based on your request:`);
-  if (prompt?.trim()) lines.push(`> "${prompt.trim()}"`);
-  lines.push("");
-  lines.push(`• Tables: ${nodes.length}${tableNames.length ? ` — ${top}` : ""}`);
-  lines.push(`• Relationships: ${relCount}`);
-  lines.push(
-    ...fieldsPerTable
-      .slice(0, 5)
-      .map(
-        (r) => `  - ${r.table}: ${r.fields} fields (PK:${r.pks}${r.fks ? `, FK:${r.fks}` : ""})`,
-      ),
-  );
-  if (fieldsPerTable.length > 5) lines.push(`  - …and ${fieldsPerTable.length - 5} more tables`);
-  lines.push("");
-  lines.push(`You can ask me to rename tables/fields, add columns, or change relationships.`);
-  return lines.join("\n");
+    const relCount = edges.length;
+
+    const fieldsPerTable = nodes.map((n: any) => {
+      const schema = n?.data?.schema ?? [];
+      return {
+        table: n?.data?.label || n?.id,
+        fields: schema.length,
+        pks: schema.filter((f: any) => f.key === "PK").length,
+        fks: schema.filter((f: any) => f.key === "FK").length,
+      };
+    });
+
+    const topTables = tableNames.slice(0, 5).join(", ");
+    const hasMoreTables = tableNames.length > 5;
+
+    const lines: string[] = [];
+    lines.push("Here's the ERD based on your request:");
+
+    if (prompt?.trim()) {
+      lines.push(`> "${prompt.trim()}"`);
+    }
+
+    lines.push("");
+    lines.push(
+      `• Tables: ${nodes.length}${tableNames.length ? ` — ${topTables}${hasMoreTables ? "…" : ""}` : ""}`,
+    );
+    lines.push(`• Relationships: ${relCount}`);
+
+    // Add table details
+    const tableDetails = fieldsPerTable.slice(0, 5).map((r) => {
+      const fkInfo = r.fks > 0 ? `, FK:${r.fks}` : "";
+      return `  - ${r.table}: ${r.fields} fields (PK:${r.pks}${fkInfo})`;
+    });
+
+    lines.push(...tableDetails);
+
+    if (fieldsPerTable.length > 5) {
+      lines.push(`  - …and ${fieldsPerTable.length - 5} more tables`);
+    }
+
+    lines.push("");
+    lines.push("You can ask me to rename tables/fields, add columns, or change relationships.");
+
+    return lines.join("\n");
+  } catch (error) {
+    logger.error({ error }, "Failed to build assistant summary");
+    return "Diagram generated successfully. You can ask me to make changes or additions.";
+  }
 }
 
-/* ============================= CRUD ============================= */
-
-export async function listMyDiagrams(req: Request, res: Response, next: NextFunction) {
+/**
+ * Validates diagram limits for different user types
+ */
+async function validateDiagramLimits(
+  req: Request,
+): Promise<{ allowed: boolean; message?: string }> {
   try {
+    const user = (req as any).user;
+    const isGuest = !user?.id;
+    const owner = getOwnerFilter(req);
+
+    if (isGuest) {
+      const aid = req.signedCookies?.aid as string | undefined;
+      if (!aid) {
+        return { allowed: false, message: "Missing anonymous ID" };
+      }
+
+      const count = await DiagramModel.countDocuments({ ownerAnonId: aid });
+      if (count >= GUEST_DIAGRAM_LIMIT) {
+        return {
+          allowed: false,
+          message: `Guest diagram limit reached (${GUEST_DIAGRAM_LIMIT}). Please sign in to create more.`,
+        };
+      }
+    } else if (user.plan === "free") {
+      const count = await DiagramModel.countDocuments({ userId: user.id });
+      if (count >= FREE_PLAN_DIAGRAM_LIMIT) {
+        return {
+          allowed: false,
+          message: `Free plan limit reached (${FREE_PLAN_DIAGRAM_LIMIT} diagrams). Upgrade to create more.`,
+        };
+      }
+    }
+
+    return { allowed: true };
+  } catch (error) {
+    logError(error, { operation: "validateDiagramLimits" });
+    return { allowed: false, message: "Failed to validate diagram limits" };
+  }
+}
+
+/**
+ * Processes AI generation result and normalizes the output
+ */
+function processAIGenerationResult(
+  ai: AIGenerationResult,
+  existing: any,
+  prompt: string,
+): { nodes: any[]; edges: any[]; message: string } {
+  try {
+    let nextNodes: any[] = [];
+    let nextEdges: any[] = [];
+
+    if (Array.isArray(ai?.ops)) {
+      // Handle operations-based generation
+      const normalizedOps = ai.ops.map((o: any) =>
+        o?.op === "add_field" ? { ...o, key: toCanonicalKey(o.key) } : o,
+      );
+
+      const applied = applyOpsInMemory(
+        existing.toObject ? existing.toObject() : existing,
+        normalizedOps,
+      );
+
+      const strict = normalizeErd(applied);
+      nextNodes = strict.nodes;
+      nextEdges = strict.edges;
+    } else {
+      // Handle direct nodes/edges generation
+      const strict = normalizeErd({
+        nodes: ai?.nodes ?? [],
+        edges: ai?.edges ?? [],
+      });
+      nextNodes = strict.nodes;
+      nextEdges = strict.edges;
+    }
+
+    const assistantMessage =
+      ai?.message ||
+      buildAssistantSummary({
+        nodes: nextNodes,
+        edges: nextEdges,
+        prompt: prompt.trim(),
+      });
+
+    return {
+      nodes: nextNodes,
+      edges: nextEdges,
+      message: assistantMessage,
+    };
+  } catch (error) {
+    logError(error, { operation: "processAIGenerationResult" });
+    throw new Error("Failed to process AI generation result");
+  }
+}
+
+/* ============================= CRUD OPERATIONS ============================= */
+
+/**
+ * Lists diagrams for the authenticated user with pagination
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @param next - Express next function
+ * @returns Paginated list of diagrams
+ */
+export async function listMyDiagrams(req: Request, res: Response, next: NextFunction) {
+  const operation = "listMyDiagrams";
+  const userId = (req as any).user?.id;
+
+  try {
+    // Validate and sanitize pagination parameters
     const page = Math.max(1, Number(req.query.page) || 1);
-    const limit = Math.min(100, Number(req.query.limit) || 20);
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
     const skip = (page - 1) * limit;
 
     const owner = getOwnerFilter(req);
+
+    logSuccess("Fetching diagrams list", { operation, userId, additionalInfo: { page, limit } });
+
     const [items, total] = await Promise.all([
       DiagramModel.find(owner).sort({ updatedAt: -1 }).skip(skip).limit(limit).lean(),
       DiagramModel.countDocuments(owner),
     ]);
 
-    return res.json(ok({ items, page, limit, total, pages: Math.ceil(total / limit) }));
+    const pages = Math.ceil(total / limit);
+
+    logSuccess("Diagrams list fetched successfully", {
+      operation,
+      userId,
+      additionalInfo: { count: items.length, total, pages },
+    });
+
+    return res.json(
+      ok({
+        items,
+        page,
+        limit,
+        total,
+        pages,
+      }),
+    );
   } catch (err) {
-    console.error("[listMyDiagrams] error:", err);
+    logError(err, { operation, userId });
     return next(err);
   }
 }
 
+/**
+ * Retrieves a specific diagram by ID
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @returns Diagram data or error response
+ */
 export async function getDiagram(req: Request, res: Response) {
+  const operation = "getDiagram";
+  const { id } = req.params;
+  const userId = (req as any).user?.id;
+
   try {
-    const { id } = req.params;
-    if (!Types.ObjectId.isValid(id)) {
+    // Validate ObjectId format
+    if (!isValidObjectId(id)) {
+      logError(new Error("Invalid ObjectId format"), { operation, userId, diagramId: id });
       return res.status(400).json(fail("Invalid diagram id", "BAD_ID"));
     }
+
     const owner = getOwnerFilter(req);
-    const doc = await DiagramModel.findOne({ _id: new Types.ObjectId(id), ...owner }).lean();
-    if (!doc) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
+
+    logSuccess("Fetching diagram", { operation, userId, diagramId: id });
+
+    const doc = await DiagramModel.findOne({
+      _id: new Types.ObjectId(id),
+      ...owner,
+    }).lean();
+
+    if (!doc) {
+      logError(new Error("Diagram not found"), { operation, userId, diagramId: id });
+      return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
+    }
+
+    logSuccess("Diagram fetched successfully", { operation, userId, diagramId: id });
+
     return res.json(ok(doc));
   } catch (err) {
-    console.error("[getDiagram] error:", err);
+    logError(err, { operation, userId, diagramId: id });
     return res.status(500).json(fail("Failed to fetch diagram", "SERVER_ERROR"));
   }
 }
 
+/**
+ * Deletes a specific diagram by ID
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @returns Success response or error
+ */
 export async function deleteDiagram(req: Request, res: Response) {
+  const operation = "deleteDiagram";
+  const { id } = req.params;
+  const userId = (req as any).user?.id;
+
   try {
-    const { id } = req.params;
-    if (!Types.ObjectId.isValid(id)) {
+    // Validate ObjectId format
+    if (!isValidObjectId(id)) {
+      logError(new Error("Invalid ObjectId format"), { operation, userId, diagramId: id });
       return res.status(400).json(fail("Invalid diagram id", "BAD_ID"));
     }
+
     const owner = getOwnerFilter(req);
-    const r = await DiagramModel.deleteOne({ _id: new Types.ObjectId(id), ...owner });
-    if (!r.deletedCount) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
+
+    logSuccess("Deleting diagram", { operation, userId, diagramId: id });
+
+    const result = await DiagramModel.deleteOne({
+      _id: new Types.ObjectId(id),
+      ...owner,
+    });
+
+    if (!result.deletedCount) {
+      logError(new Error("Diagram not found for deletion"), { operation, userId, diagramId: id });
+      return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
+    }
+
+    logSuccess("Diagram deleted successfully", { operation, userId, diagramId: id });
+
     return res.json(ok({}));
   } catch (err) {
-    console.error("[deleteDiagram] error:", err);
+    logError(err, { operation, userId, diagramId: id });
     return res.status(500).json(fail("Failed to delete diagram", "SERVER_ERROR"));
   }
 }
 
+/**
+ * Creates a new diagram with validation and limit checks
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @returns Created diagram or error response
+ */
 export async function createDiagram(req: Request, res: Response) {
+  const operation = "createDiagram";
+  const userId = (req as any).user?.id;
+
   try {
+    // Validate request payload
     const parsed = CreateDiagramReq.safeParse({ body: req.body });
     if (!parsed.success) {
+      logError(new Error("Invalid diagram payload"), {
+        operation,
+        userId,
+        additionalInfo: { validationErrors: parsed.error },
+      });
       return res.status(400).json(fail("Invalid diagram payload", "VALIDATION_ERROR"));
     }
 
@@ -134,402 +558,693 @@ export async function createDiagram(req: Request, res: Response) {
       model?: string;
     };
 
-    const owner = getOwnerFilter(req);
-    const user = (req as any).user;
-    const isGuest = !user?.id;
+    // Sanitize input
+    const sanitizedName = sanitizeInput(name);
+    const sanitizedType = sanitizeInput(type);
+    const sanitizedModel = sanitizeInput(model) || DEFAULT_MODEL;
 
-    if (isGuest) {
-      const aid = req.signedCookies?.aid as string | undefined;
-      if (!aid) return res.status(400).json(fail("Missing anon id", "MISSING_AID"));
-      const count = await DiagramModel.countDocuments({ ownerAnonId: aid });
-      if (count >= 4) {
-        return res
-          .status(403)
-          .json(
-            fail("Guest diagram limit reached (4). Please sign in to create more.", "GUEST_LIMIT"),
-          );
-      }
-    } else if (user.plan === "free") {
-      const count = await DiagramModel.countDocuments({ userId: user.id });
-      if (count >= 10) {
-        return res
-          .status(403)
-          .json(
-            fail("Free plan limit reached (10 diagrams). Upgrade to create more.", "FREE_LIMIT"),
-          );
-      }
+    // Validate diagram limits
+    const limitCheck = await validateDiagramLimits(req);
+    if (!limitCheck.allowed) {
+      logError(new Error("Diagram limit exceeded"), {
+        operation,
+        userId,
+        additionalInfo: { message: limitCheck.message },
+      });
+
+      const statusCode = limitCheck.message?.includes("Guest") ? 403 : 403;
+      const errorCode = limitCheck.message?.includes("Guest") ? "GUEST_LIMIT" : "FREE_LIMIT";
+
+      return res.status(statusCode).json(fail(limitCheck.message!, errorCode));
     }
+
+    const owner = getOwnerFilter(req);
+
+    logSuccess("Creating new diagram", {
+      operation,
+      userId,
+      additionalInfo: { name: sanitizedName, type: sanitizedType, model: sanitizedModel },
+    });
 
     const doc = await DiagramModel.create({
       ...owner,
-      title: name.trim(),
-      type,
+      title: sanitizedName,
+      type: sanitizedType,
       prompt: "",
-      model: (model as any) ?? "gemini-2.5-flash-lite",
+      model: sanitizedModel as any,
       nodes: [],
       edges: [],
       chat: [],
       version: 0,
     });
 
+    logSuccess("Diagram created successfully", {
+      operation,
+      userId,
+      diagramId: doc._id.toString(),
+    });
+
     return res.status(201).json(ok(doc));
   } catch (err) {
-    console.error("[createDiagram] error:", err);
+    logError(err, { operation, userId });
     return res.status(500).json(fail("Failed to create diagram", "SERVER_ERROR"));
   }
 }
 
-/* --------------------- UPDATE (chat integrated) --------------------- */
+/* ============================= EXPORT OPERATIONS ============================= */
 
-export async function updateDiagram(req: Request, res: Response) {
-  if (!UpdateDiagramReq || typeof (UpdateDiagramReq as any).safeParse !== "function") {
-    console.error("[DiagramCtrl] UpdateDiagramReq missing/invalid");
-    return res.status(500).json(fail("Server schema not loaded", "SERVER_CONFIG"));
-  }
-  const parsed = UpdateDiagramReq.safeParse({ params: req.params, body: req.body });
-  if (!parsed.success) return res.status(400).json(fail("Invalid update", "VALIDATION_ERROR"));
-
-  const { id } = parsed.data.params;
-  const { title, type, nodes, edges, prompt, model } = parsed.data.body as any;
-  const clientVersion: number | undefined = (parsed.data.body as any).version;
-
-  try {
-    if (!Types.ObjectId.isValid(id)) {
-      return res.status(400).json(fail("Invalid diagram id", "BAD_ID"));
-    }
-
-    const owner = getOwnerFilter(req);
-    const existing = await DiagramModel.findOne({ _id: new Types.ObjectId(id), ...owner });
-    if (!existing) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
-
-    const updates: Record<string, any> = {};
-    if (typeof title === "string" && title.trim()) updates.title = title.trim();
-    if (typeof type === "string") updates.type = type;
-
-    // Manual nodes/edges path
-    if (Array.isArray(nodes) || Array.isArray(edges)) {
-      const input = {
-        nodes: Array.isArray(nodes) ? nodes : (existing.nodes as any[]),
-        edges: Array.isArray(edges) ? edges : (existing.edges as any[]),
-      };
-      const strict = normalizeErd(input);
-
-      const doc = await DiagramModel.findOneAndUpdate(
-        { _id: existing._id, version: existing.version ?? 0 },
-        { $set: { ...updates, nodes: strict.nodes, edges: strict.edges }, $inc: { version: 1 } },
-        { new: true },
-      ).lean();
-
-      if (!doc) return res.status(409).json(fail("Version conflict", "CONFLICT"));
-      return res.json(ok(doc));
-    }
-
-    // AI generation path
-    if (prompt && prompt.trim()) {
-      if (!isValidErd(prompt)) {
-        return res
-          .status(400)
-          .json(fail("Your prompt does not seem ERD-related.", "INVALID_ERD_PROMPT"));
-      }
-
-      const chosenModel = (model || (existing as any).model || "gemini-2.5-flash-lite") as any;
-      const baseVersion =
-        typeof clientVersion === "number" ? clientVersion : (existing.version ?? 0);
-
-      const prevChat: ChatMessage[] = Array.isArray((existing as any).chat)
-        ? ((existing as any).chat as ChatMessage[])
-        : [];
-
-      const now = Date.now();
-      const userMsg: ChatMessage = { role: "user", content: prompt.trim(), ts: now };
-
-      // ❌ Do NOT append a static ack; rely on frontend spinner instead
-      const workingChat: ChatMessage[] = [...prevChat, userMsg].slice(-100);
-
-      const chatTail = tailForPrompt(workingChat, 6);
-      const composed = composePrompt(
-        (existing as any).toObject ? (existing as any).toObject() : existing,
-        prompt,
-        chatTail,
-      );
-
-      let nextNodes: any[] = [];
-      let nextEdges: any[] = [];
-      let assistantMessage: string | undefined;
-
-      try {
-        // ai can be {nodes, edges, message?} or {ops, message?}
-        const ai = await hedgedGenerate(composed, chosenModel);
-
-        if (Array.isArray(ai?.ops)) {
-          const normalizedOps = ai.ops.map((o: any) =>
-            o?.op === "add_field" ? { ...o, key: toCanonicalKey(o.key) } : o,
-          );
-          const applied = applyOpsInMemory(
-            (existing as any).toObject ? (existing as any).toObject() : existing,
-            normalizedOps,
-          );
-          const strict = normalizeErd(applied);
-          nextNodes = strict.nodes;
-          nextEdges = strict.edges;
-        } else {
-          const strict = normalizeErd({ nodes: ai?.nodes ?? [], edges: ai?.edges ?? [] });
-          nextNodes = strict.nodes;
-          nextEdges = strict.edges;
-        }
-
-        // Build a human-readable assistant message (fallback if provider doesn't supply one)
-        assistantMessage =
-          (ai as any)?.message ||
-          buildAssistantSummary({ nodes: nextNodes, edges: nextEdges, prompt: prompt.trim() });
-
-        const finalChat = [
-          ...workingChat,
-          { role: "assistant", content: assistantMessage, ts: Date.now() },
-        ].slice(-100);
-
-        const doc = await DiagramModel.findOneAndUpdate(
-          { _id: existing._id, version: baseVersion },
-          {
-            $set: {
-              ...(title ? { title: title.trim() } : {}),
-              ...(type ? { type } : {}),
-              nodes: nextNodes,
-              edges: nextEdges,
-              prompt: prompt.trim(),
-              model: chosenModel,
-              chat: finalChat,
-            },
-            $inc: { version: 1 },
-          },
-          { new: true },
-        ).lean();
-
-        if (!doc) return res.status(409).json(fail("Version conflict", "CONFLICT"));
-        return res.json(ok(doc));
-      } catch (err: any) {
-        console.error("[updateDiagram:AI] error:", err);
-        const errMsg = err?.message || "AI generation failed";
-
-        const finalChat = [
-          ...workingChat,
-          { role: "assistant", content: `There was an error: ${errMsg}`, ts: Date.now() },
-        ].slice(-100);
-
-        await DiagramModel.findOneAndUpdate(
-          { _id: existing._id, version: baseVersion },
-          {
-            $set: {
-              ...(title ? { title: title.trim() } : {}),
-              ...(type ? { type } : {}),
-              prompt: prompt.trim(),
-              model: chosenModel,
-              chat: finalChat,
-            },
-            $inc: { version: 1 },
-          },
-          { new: true },
-        )
-          .lean()
-          .catch(() => {});
-
-        if (errMsg.includes("429") || /quota/i.test(errMsg)) {
-          return res.status(429).json(fail(errMsg, "AI_QUOTA_EXCEEDED"));
-        }
-        if (err?.response?.status) {
-          return res.status(err.response.status).json(fail(errMsg, "AI_FAILED"));
-        }
-        return res.status(502).json(fail(errMsg, "AI_FAILED"));
-      }
-    }
-
-    if (model) updates.model = model;
-
-    if (Object.keys(updates).length === 0) {
-      return res.json(ok((existing as any).toObject ? (existing as any).toObject() : existing));
-    }
-
-    const doc = await DiagramModel.findOneAndUpdate(
-      { _id: existing._id, version: (existing as any).version ?? 0 },
-      { $set: updates, $inc: { version: 1 } },
-      { new: true },
-    ).lean();
-
-    if (!doc) return res.status(409).json(fail("Version conflict", "CONFLICT"));
-    return res.json(ok(doc));
-  } catch (err) {
-    console.error("[updateDiagram] error:", err);
-    return res.status(500).json(fail("Failed to update diagram", "SERVER_ERROR"));
-  }
-}
-
-/* -------------------------- SQL export route ------------------------- */
-
+/**
+ * Exports diagram as SQL DDL statements
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @returns SQL file download or error response
+ */
 export async function exportDiagramSql(req: Request, res: Response) {
-  try {
-    const out = await buildSqlExport(req);
+  const operation = "exportDiagramSql";
+  const { id } = req.params;
+  const userId = (req as any).user?.id;
 
-    if (out.error) {
-      return res.status(out.status).json(fail(out.message, out.code));
+  try {
+    logSuccess("Exporting diagram to SQL", { operation, userId, diagramId: id });
+
+    const exportResult = await buildSqlExport(req);
+
+    if (exportResult.error) {
+      logError(new Error(exportResult.message), {
+        operation,
+        userId,
+        diagramId: id,
+        additionalInfo: { status: exportResult.status, code: exportResult.code },
+      });
+      return res.status(exportResult.status).json(fail(exportResult.message, exportResult.code));
     }
 
-    res.setHeader("Content-Type", out.contentType);
-    res.setHeader("Content-Disposition", out.disposition);
-    res.send(out.body);
+    // Set appropriate headers for file download
+    res.setHeader("Content-Type", exportResult.contentType);
+    res.setHeader("Content-Disposition", exportResult.disposition);
+
+    logSuccess("SQL export completed successfully", { operation, userId, diagramId: id });
+
+    res.send(exportResult.body);
   } catch (err) {
-    console.error("[exportDiagramSql] error:", err);
+    logError(err, { operation, userId, diagramId: id });
     return res.status(500).json(fail("Failed to export SQL", "SERVER_ERROR"));
   }
 }
 
-/* ======================= Node Schema CRUD ======================= */
+/* ============================= NODE SCHEMA CRUD ============================= */
 
+/**
+ * Adds a new field to a diagram node
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @returns Updated diagram or error response
+ */
 export async function addNodeField(req: Request, res: Response) {
-  const parsed = FieldCreateReq.safeParse({ params: req.params, body: req.body });
-  if (!parsed.success)
-    return res.status(400).json(fail("Invalid field payload", "VALIDATION_ERROR"));
-
-  const { id, nodeId } = parsed.data.params;
-  const field = parsed.data.body;
-
-  const loaded = await loadDiagramWithNode(req, id, nodeId);
-  if ("error" in loaded) return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
-  const { diagram, node } = loaded;
-
-  const exists = node.data!.schema.some((f: any) => f.id === field.id);
-  if (exists) return res.status(409).json(fail("Field id already exists", "CONFLICT"));
-
-  node.data!.schema.push({ key: "NONE", nullable: true, default: null, ...field });
-  diagram.markModified("nodes");
-  await diagram.save();
-  return res.json(ok(diagram));
-}
-
-export async function updateNodeField(req: Request, res: Response) {
-  const parsed = FieldUpdateReq.safeParse({ params: req.params, body: req.body });
-  if (!parsed.success)
-    return res.status(400).json(fail("Invalid field update", "VALIDATION_ERROR"));
-
-  const { id, nodeId, fieldId } = parsed.data.params;
-  const patch = parsed.data.body;
-
-  const loaded = await loadDiagramWithNode(req, id, nodeId);
-  if ("error" in loaded) return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
-  const { diagram, node } = loaded;
-
-  const idx = node.data!.schema.findIndex((f: any) => f.id === fieldId);
-
-  // upsert
-  if (idx === -1) {
-    const newId = (patch.id ?? fieldId)?.trim();
-    const title = patch.title?.trim();
-    const type = patch.type?.trim();
-    if (!newId || !title || !type) {
-      return res
-        .status(400)
-        .json(fail("For new field, provide id, title and type.", "VALIDATION_ERROR"));
-    }
-    const dup = node.data!.schema.some((f: any) => f.id === newId);
-    if (dup) return res.status(409).json(fail("Field id already exists", "CONFLICT"));
-
-    node.data!.schema.push({
-      id: newId,
-      title,
-      type,
-      key: patch.key ?? "NONE",
-      nullable: true,
-      default: null,
-    });
-    diagram.markModified("nodes");
-    await diagram.save();
-    return res.json(ok(diagram));
-  }
-
-  const current = node.data!.schema[idx];
-
-  if (patch.id && patch.id !== current.id) {
-    const dup = node.data!.schema.some((f: any) => f.id === patch.id);
-    if (dup) return res.status(409).json(fail("New field id already exists", "CONFLICT"));
-    rewriteHandlesForFieldRename(diagram as any, current.id, patch.id);
-  }
-
-  node.data!.schema[idx] = {
-    ...current,
-    ...(patch.title !== undefined ? { title: patch.title } : {}),
-    ...(patch.type !== undefined ? { type: patch.type } : {}),
-    ...(patch.key !== undefined ? { key: patch.key } : {}),
-    ...(patch.id !== undefined ? { id: patch.id } : {}),
-  };
-
-  diagram.markModified("nodes");
-  await diagram.save();
-  return res.json(ok(diagram));
-}
-
-export async function deleteNodeField(req: Request, res: Response) {
-  const parsed = FieldDeleteReq.safeParse({ params: req.params });
-  if (!parsed.success) return res.status(400).json(fail("Invalid request", "VALIDATION_ERROR"));
-
-  const { id, nodeId, fieldId } = parsed.data.params;
-  const loaded = await loadDiagramWithNode(req, id, nodeId);
-  if ("error" in loaded) return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
-  const { diagram, node } = loaded;
-
-  const before = node.data!.schema.length;
-  node.data!.schema = node.data!.schema.filter((f: any) => f.id !== fieldId);
-  if (node.data!.schema.length === before) {
-    return res.status(404).json(fail("Field not found", "NOT_FOUND"));
-  }
-
-  removeEdgesTouchingField(diagram as any, fieldId);
-  diagram.markModified("nodes");
-  await diagram.save();
-  return res.json(ok(diagram));
-}
-
-export async function updateNodeLabel(req: Request, res: Response) {
-  const parsed = NodeLabelUpdateReq.safeParse({ params: req.params, body: req.body });
-  if (!parsed.success)
-    return res.status(400).json(fail("Invalid label payload", "VALIDATION_ERROR"));
-
-  const { id, nodeId } = parsed.data.params;
-  const { label } = parsed.data.body;
-
-  const loaded = await loadDiagramWithNode(req, id, nodeId);
-  if ("error" in loaded) return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
-  const { diagram, node } = loaded;
-
-  node.data!.label = label;
-  diagram.markModified("nodes");
-  await diagram.save();
-  return res.json(ok(diagram));
-}
-
-/* --------------------- STREAMING UPDATE (chat integrated) --------------------- */
-
-export async function updateDiagramStream(req: Request, res: Response) {
-  if (!UpdateDiagramReq || typeof (UpdateDiagramReq as any).safeParse !== "function") {
-    console.error("[DiagramCtrl] UpdateDiagramReq missing/invalid");
-    return res.status(500).json(fail("Server schema not loaded", "SERVER_CONFIG"));
-  }
-  const parsed = UpdateDiagramReq.safeParse({ params: req.params, body: req.body });
-  if (!parsed.success) return res.status(400).json(fail("Invalid update", "VALIDATION_ERROR"));
-
-  const { id } = parsed.data.params;
-  const { title, type, nodes, edges, prompt, model } = parsed.data.body as any;
-  const clientVersion: number | undefined = (parsed.data.body as any).version;
+  const operation = "addNodeField";
+  const userId = (req as any).user?.id;
 
   try {
-    if (!Types.ObjectId.isValid(id)) {
+    // Validate request payload
+    const parsed = FieldCreateReq.safeParse({ params: req.params, body: req.body });
+    if (!parsed.success) {
+      logError(new Error("Invalid field payload"), {
+        operation,
+        userId,
+        additionalInfo: { validationErrors: parsed.error },
+      });
+      return res.status(400).json(fail("Invalid field payload", "VALIDATION_ERROR"));
+    }
+
+    const { id, nodeId } = parsed.data.params;
+    const field = sanitizeInput(parsed.data.body);
+
+    logSuccess("Adding field to node", {
+      operation,
+      userId,
+      diagramId: id,
+      additionalInfo: { nodeId, fieldId: field.id },
+    });
+
+    const loaded = await loadDiagramWithNode(req, id, nodeId);
+    if ("error" in loaded) {
+      logError(new Error(loaded.error), {
+        operation,
+        userId,
+        diagramId: id,
+        additionalInfo: { nodeId },
+      });
+      return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
+    }
+
+    const { diagram, node } = loaded;
+
+    // Check if field already exists
+    const exists = node.data!.schema.some((f: any) => f.id === field.id);
+    if (exists) {
+      logError(new Error("Field ID already exists"), {
+        operation,
+        userId,
+        diagramId: id,
+        additionalInfo: { nodeId, fieldId: field.id },
+      });
+      return res.status(409).json(fail("Field id already exists", "CONFLICT"));
+    }
+
+    // Add the new field with default values
+    node.data!.schema.push({
+      key: "NONE",
+      nullable: true,
+      default: null,
+      ...field,
+    });
+
+    diagram.markModified("nodes");
+    await diagram.save();
+
+    logSuccess("Field added successfully", {
+      operation,
+      userId,
+      diagramId: id,
+      additionalInfo: { nodeId, fieldId: field.id },
+    });
+
+    return res.json(ok(diagram));
+  } catch (err) {
+    logError(err, { operation, userId });
+    return res.status(500).json(fail("Failed to add field", "SERVER_ERROR"));
+  }
+}
+
+/**
+ * Updates an existing field in a diagram node (supports upsert)
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @returns Updated diagram or error response
+ */
+export async function updateNodeField(req: Request, res: Response) {
+  const operation = "updateNodeField";
+  const userId = (req as any).user?.id;
+
+  try {
+    // Validate request payload
+    const parsed = FieldUpdateReq.safeParse({ params: req.params, body: req.body });
+    if (!parsed.success) {
+      logError(new Error("Invalid field update payload"), {
+        operation,
+        userId,
+        additionalInfo: { validationErrors: parsed.error },
+      });
+      return res.status(400).json(fail("Invalid field update", "VALIDATION_ERROR"));
+    }
+
+    const { id, nodeId, fieldId } = parsed.data.params;
+    const patch = sanitizeInput(parsed.data.body);
+
+    logSuccess("Updating node field", {
+      operation,
+      userId,
+      diagramId: id,
+      additionalInfo: { nodeId, fieldId },
+    });
+
+    const loaded = await loadDiagramWithNode(req, id, nodeId);
+    if ("error" in loaded) {
+      logError(new Error(loaded.error), {
+        operation,
+        userId,
+        diagramId: id,
+        additionalInfo: { nodeId },
+      });
+      return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
+    }
+
+    const { diagram, node } = loaded;
+    const idx = node.data!.schema.findIndex((f: any) => f.id === fieldId);
+
+    // Handle upsert (create new field if not found)
+    if (idx === -1) {
+      const newId = (patch.id ?? fieldId)?.trim();
+      const title = patch.title?.trim();
+      const type = patch.type?.trim();
+
+      if (!newId || !title || !type) {
+        logError(new Error("Missing required fields for new field creation"), {
+          operation,
+          userId,
+          diagramId: id,
+          additionalInfo: { nodeId, fieldId, newId, title, type },
+        });
+        return res
+          .status(400)
+          .json(fail("For new field, provide id, title and type.", "VALIDATION_ERROR"));
+      }
+
+      const duplicate = node.data!.schema.some((f: any) => f.id === newId);
+      if (duplicate) {
+        logError(new Error("Field ID already exists"), {
+          operation,
+          userId,
+          diagramId: id,
+          additionalInfo: { nodeId, fieldId: newId },
+        });
+        return res.status(409).json(fail("Field id already exists", "CONFLICT"));
+      }
+
+      node.data!.schema.push({
+        id: newId,
+        title,
+        type,
+        key: patch.key ?? "NONE",
+        nullable: true,
+        default: null,
+      });
+
+      diagram.markModified("nodes");
+      await diagram.save();
+
+      logSuccess("New field created successfully", {
+        operation,
+        userId,
+        diagramId: id,
+        additionalInfo: { nodeId, fieldId: newId },
+      });
+
+      return res.json(ok(diagram));
+    }
+
+    // Update existing field
+    const current = node.data!.schema[idx];
+
+    // Handle field ID change (requires updating references)
+    if (patch.id && patch.id !== current.id) {
+      const duplicate = node.data!.schema.some((f: any) => f.id === patch.id);
+      if (duplicate) {
+        logError(new Error("New field ID already exists"), {
+          operation,
+          userId,
+          diagramId: id,
+          additionalInfo: { nodeId, fieldId, newFieldId: patch.id },
+        });
+        return res.status(409).json(fail("New field id already exists", "CONFLICT"));
+      }
+
+      // Update all references to the old field ID
+      rewriteHandlesForFieldRename(diagram as any, current.id, patch.id);
+    }
+
+    // Apply updates to the field
+    node.data!.schema[idx] = {
+      ...current,
+      ...(patch.title !== undefined ? { title: patch.title } : {}),
+      ...(patch.type !== undefined ? { type: patch.type } : {}),
+      ...(patch.key !== undefined ? { key: patch.key } : {}),
+      ...(patch.id !== undefined ? { id: patch.id } : {}),
+    };
+
+    diagram.markModified("nodes");
+    await diagram.save();
+
+    logSuccess("Field updated successfully", {
+      operation,
+      userId,
+      diagramId: id,
+      additionalInfo: { nodeId, fieldId },
+    });
+
+    return res.json(ok(diagram));
+  } catch (err) {
+    logError(err, { operation, userId });
+    return res.status(500).json(fail("Failed to update field", "SERVER_ERROR"));
+  }
+}
+
+/**
+ * Deletes a field from a diagram node
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @returns Updated diagram or error response
+ */
+export async function deleteNodeField(req: Request, res: Response) {
+  const operation = "deleteNodeField";
+  const userId = (req as any).user?.id;
+
+  try {
+    // Validate request parameters
+    const parsed = FieldDeleteReq.safeParse({ params: req.params });
+    if (!parsed.success) {
+      logError(new Error("Invalid delete request"), {
+        operation,
+        userId,
+        additionalInfo: { validationErrors: parsed.error },
+      });
+      return res.status(400).json(fail("Invalid request", "VALIDATION_ERROR"));
+    }
+
+    const { id, nodeId, fieldId } = parsed.data.params;
+
+    logSuccess("Deleting node field", {
+      operation,
+      userId,
+      diagramId: id,
+      additionalInfo: { nodeId, fieldId },
+    });
+
+    const loaded = await loadDiagramWithNode(req, id, nodeId);
+    if ("error" in loaded) {
+      logError(new Error(loaded.error), {
+        operation,
+        userId,
+        diagramId: id,
+        additionalInfo: { nodeId },
+      });
+      return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
+    }
+
+    const { diagram, node } = loaded;
+    const beforeCount = node.data!.schema.length;
+
+    // Remove the field
+    node.data!.schema = node.data!.schema.filter((f: any) => f.id !== fieldId);
+
+    if (node.data!.schema.length === beforeCount) {
+      logError(new Error("Field not found for deletion"), {
+        operation,
+        userId,
+        diagramId: id,
+        additionalInfo: { nodeId, fieldId },
+      });
+      return res.status(404).json(fail("Field not found", "NOT_FOUND"));
+    }
+
+    // Remove any edges that reference this field
+    removeEdgesTouchingField(diagram as any, fieldId);
+
+    diagram.markModified("nodes");
+    await diagram.save();
+
+    logSuccess("Field deleted successfully", {
+      operation,
+      userId,
+      diagramId: id,
+      additionalInfo: { nodeId, fieldId },
+    });
+
+    return res.json(ok(diagram));
+  } catch (err) {
+    logError(err, { operation, userId });
+    return res.status(500).json(fail("Failed to delete field", "SERVER_ERROR"));
+  }
+}
+
+/**
+ * Updates the label of a diagram node
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @returns Updated diagram or error response
+ */
+export async function updateNodeLabel(req: Request, res: Response) {
+  const operation = "updateNodeLabel";
+  const userId = (req as any).user?.id;
+
+  try {
+    // Validate request payload
+    const parsed = NodeLabelUpdateReq.safeParse({ params: req.params, body: req.body });
+    if (!parsed.success) {
+      logError(new Error("Invalid label payload"), {
+        operation,
+        userId,
+        additionalInfo: { validationErrors: parsed.error },
+      });
+      return res.status(400).json(fail("Invalid label payload", "VALIDATION_ERROR"));
+    }
+
+    const { id, nodeId } = parsed.data.params;
+    const { label } = parsed.data.body;
+    const sanitizedLabel = sanitizeInput(label);
+
+    logSuccess("Updating node label", {
+      operation,
+      userId,
+      diagramId: id,
+      additionalInfo: { nodeId, label: sanitizedLabel },
+    });
+
+    const loaded = await loadDiagramWithNode(req, id, nodeId);
+    if ("error" in loaded) {
+      logError(new Error(loaded.error), {
+        operation,
+        userId,
+        diagramId: id,
+        additionalInfo: { nodeId },
+      });
+      return res.status(404).json(fail(loaded.error, "NOT_FOUND"));
+    }
+
+    const { diagram, node } = loaded;
+
+    node.data!.label = sanitizedLabel;
+    diagram.markModified("nodes");
+    await diagram.save();
+
+    logSuccess("Node label updated successfully", {
+      operation,
+      userId,
+      diagramId: id,
+      additionalInfo: { nodeId, label: sanitizedLabel },
+    });
+
+    return res.json(ok(diagram));
+  } catch (err) {
+    logError(err, { operation, userId });
+    return res.status(500).json(fail("Failed to update node label", "SERVER_ERROR"));
+  }
+}
+
+/* ============================= STREAMING UPDATE ============================= */
+
+/**
+ * Handles streaming AI generation with proper error handling
+ */
+async function handleStreamingGeneration(
+  composed: string,
+  chosenModel: any,
+  sendSSE: (data: any) => void,
+  existing: any,
+  prompt: string,
+  title?: string,
+  type?: string,
+  baseVersion?: number,
+): Promise<{ success: boolean; data?: any; error?: string }> {
+  try {
+    let nextNodes: any[] = [];
+    let nextEdges: any[] = [];
+    let assistantMessage: string | undefined;
+    let isComplete = false;
+
+    // Start heartbeat to keep connection alive
+    const heartbeatInterval = setInterval(() => {
+      if (!isComplete) {
+        sendSSE({ type: "heartbeat", data: { timestamp: Date.now() } });
+      }
+    }, HEARTBEAT_INTERVAL);
+
+    try {
+      for await (const chunk of hedgedGenerateStream(composed, chosenModel)) {
+        if (chunk.type === "progress") {
+          sendSSE({ type: "progress", data: chunk.data });
+        } else if (chunk.type === "partial") {
+          sendSSE({ type: "partial", data: chunk.data });
+        } else if (chunk.type === "heartbeat") {
+          sendSSE({ type: "heartbeat", data: chunk.data });
+        } else if (chunk.type === "complete") {
+          isComplete = true;
+          clearInterval(heartbeatInterval);
+
+          if (chunk.error) {
+            return { success: false, error: chunk.error };
+          }
+
+          const result = processAIGenerationResult(chunk.data, existing, prompt);
+          nextNodes = result.nodes;
+          nextEdges = result.edges;
+          assistantMessage = result.message;
+
+          break;
+        }
+      }
+    } finally {
+      clearInterval(heartbeatInterval);
+    }
+
+    return {
+      success: true,
+      data: {
+        nodes: nextNodes,
+        edges: nextEdges,
+        message: assistantMessage,
+      },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: normalizeErrorMessage(error),
+    };
+  }
+}
+
+/**
+ * Handles non-streaming AI generation
+ */
+async function handleNonStreamingGeneration(
+  composed: string,
+  chosenModel: any,
+  existing: any,
+  prompt: string,
+): Promise<{ success: boolean; data?: any; error?: string }> {
+  try {
+    let nextNodes: any[] = [];
+    let nextEdges: any[] = [];
+    let assistantMessage: string | undefined;
+    let hasError = false;
+    let errorMessage = "";
+
+    for await (const chunk of hedgedGenerateStream(composed, chosenModel)) {
+      if (chunk.type === "complete") {
+        if (chunk.error) {
+          hasError = true;
+          errorMessage = chunk.error;
+          break;
+        }
+
+        const result = processAIGenerationResult(chunk.data, existing, prompt);
+        nextNodes = result.nodes;
+        nextEdges = result.edges;
+        assistantMessage = result.message;
+        break;
+      }
+    }
+
+    if (hasError) {
+      return { success: false, error: errorMessage };
+    }
+
+    return {
+      success: true,
+      data: {
+        nodes: nextNodes,
+        edges: nextEdges,
+        message: assistantMessage,
+      },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: normalizeErrorMessage(error),
+    };
+  }
+}
+
+/**
+ * Updates diagram with AI generation results
+ */
+async function updateDiagramWithResults(
+  existing: any,
+  baseVersion: number,
+  updates: {
+    title?: string;
+    type?: string;
+    nodes: any[];
+    edges: any[];
+    prompt: string;
+    model: string;
+    chat: ChatMessage[];
+  },
+): Promise<any> {
+  return await DiagramModel.findOneAndUpdate(
+    { _id: existing._id, version: baseVersion },
+    {
+      $set: {
+        ...(updates.title ? { title: updates.title.trim() } : {}),
+        ...(updates.type ? { type: updates.type } : {}),
+        nodes: updates.nodes,
+        edges: updates.edges,
+        prompt: updates.prompt.trim(),
+        model: updates.model,
+        chat: updates.chat,
+      },
+      $inc: { version: 1 },
+    },
+    { new: true },
+  ).lean();
+}
+
+/**
+ * Handles streaming AI generation for diagram updates
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @returns Streaming response or error
+ */
+export async function updateDiagramStream(req: Request, res: Response) {
+  const operation = "updateDiagramStream";
+  const userId = (req as any).user?.id;
+
+  try {
+    // Validate schema availability
+    if (!UpdateDiagramReq || typeof (UpdateDiagramReq as any).safeParse !== "function") {
+      logError(new Error("UpdateDiagramReq schema not available"), { operation, userId });
+      return res.status(500).json(fail("Server schema not loaded", "SERVER_CONFIG"));
+    }
+
+    // Validate request payload
+    const parsed = UpdateDiagramReq.safeParse({ params: req.params, body: req.body });
+    if (!parsed.success) {
+      logError(new Error("Invalid update payload"), {
+        operation,
+        userId,
+        additionalInfo: { validationErrors: parsed.error },
+      });
+      return res.status(400).json(fail("Invalid update", "VALIDATION_ERROR"));
+    }
+
+    const { id } = parsed.data.params;
+    const { title, type, nodes, edges, prompt, model } = sanitizeInput(parsed.data.body) as any;
+    const clientVersion: number | undefined = (parsed.data.body as any).version;
+
+    // Validate ObjectId format
+    if (!isValidObjectId(id)) {
+      logError(new Error("Invalid ObjectId format"), { operation, userId, diagramId: id });
       return res.status(400).json(fail("Invalid diagram id", "BAD_ID"));
     }
 
     const owner = getOwnerFilter(req);
-    const existing = await DiagramModel.findOne({ _id: new Types.ObjectId(id), ...owner });
-    if (!existing) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
 
-    // Manual nodes/edges path - not supported in streaming
+    logSuccess("Starting diagram stream update", {
+      operation,
+      userId,
+      diagramId: id,
+      additionalInfo: { hasPrompt: !!prompt, hasNodes: !!nodes, hasEdges: !!edges },
+    });
+
+    const existing = await DiagramModel.findOne({ _id: new Types.ObjectId(id), ...owner });
+    if (!existing) {
+      logError(new Error("Diagram not found"), { operation, userId, diagramId: id });
+      return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
+    }
+
+    // Manual nodes/edges updates are not supported in streaming mode
     if (Array.isArray(nodes) || Array.isArray(edges)) {
+      logError(new Error("Manual updates not supported in streaming mode"), {
+        operation,
+        userId,
+        diagramId: id,
+      });
       return res
         .status(400)
         .json(fail("Manual updates not supported in streaming mode", "NOT_SUPPORTED"));
@@ -537,194 +1252,124 @@ export async function updateDiagramStream(req: Request, res: Response) {
 
     // AI generation path
     if (prompt && prompt.trim()) {
+      // Validate ERD prompt
       if (!isValidErd(prompt)) {
+        logError(new Error("Invalid ERD prompt"), {
+          operation,
+          userId,
+          diagramId: id,
+          additionalInfo: { prompt: prompt.substring(0, 100) },
+        });
         return res
           .status(400)
           .json(fail("Your prompt does not seem ERD-related.", "INVALID_ERD_PROMPT"));
       }
 
-      const chosenModel = (model || (existing as any).model || "gemini-2.5-flash-lite") as any;
+      const chosenModel = (model || (existing as any).model || DEFAULT_MODEL) as any;
       const baseVersion =
         typeof clientVersion === "number" ? clientVersion : (existing.version ?? 0);
 
+      // Prepare chat history
       const prevChat: ChatMessage[] = Array.isArray((existing as any).chat)
         ? ((existing as any).chat as ChatMessage[])
         : [];
 
       const now = Date.now();
       const userMsg: ChatMessage = { role: "user", content: prompt.trim(), ts: now };
-      const workingChat: ChatMessage[] = [...prevChat, userMsg].slice(-100);
+      const workingChat: ChatMessage[] = [...prevChat, userMsg].slice(-MAX_CHAT_HISTORY);
 
-      const chatTail = tailForPrompt(workingChat, 6);
+      const chatTail = tailForPrompt(workingChat, MAX_CHAT_TAIL);
       const composed = composePrompt(
         (existing as any).toObject ? (existing as any).toObject() : existing,
         prompt,
         chatTail,
       );
 
-      // Check if client wants streaming (Accept header or query param)
-      const wantsStreaming =
-        req.headers.accept?.includes("text/event-stream") || req.query.stream === "true";
+      // Check if client wants streaming
+      const isStreaming = wantsStreaming(req);
 
-      if (wantsStreaming) {
+      if (isStreaming) {
         // Set up Server-Sent Events
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
-        res.setHeader(
-          "Access-Control-Allow-Headers",
-          "Content-Type, Authorization, Cache-Control, Accept",
-        );
-        res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
-        res.setHeader("Access-Control-Allow-Credentials", "true");
-
-        const sendSSE = (data: any) => {
-          try {
-            res.write(`data: ${JSON.stringify(data)}\n\n`);
-          } catch (error) {
-            console.log("Client disconnected, stopping stream");
-            throw error;
-          }
-        };
+        setupSSEHeaders(res, req);
+        const sendSSE = createSSESender(res);
 
         // Handle client disconnect
         req.on("close", () => {
-          console.log("Client disconnected from streaming endpoint");
+          logger.info(
+            { operation, userId, diagramId: req.params.id },
+            "Client disconnected from streaming endpoint",
+          );
         });
 
         try {
           sendSSE({ type: "start", message: "Starting AI generation..." });
 
-          let nextNodes: any[] = [];
-          let nextEdges: any[] = [];
-          let assistantMessage: string | undefined;
-          let isComplete = false;
+          const result = await handleStreamingGeneration(
+            composed,
+            chosenModel as any,
+            sendSSE,
+            existing,
+            prompt,
+            title,
+            type,
+            baseVersion,
+          );
 
-          // Start heartbeat to keep connection alive
-          const heartbeatInterval = setInterval(() => {
-            if (!isComplete) {
-              sendSSE({ type: "heartbeat", data: { timestamp: Date.now() } });
-            }
-          }, 5000); // Send heartbeat every 5 seconds
-
-          try {
-            for await (const chunk of hedgedGenerateStream(composed, chosenModel)) {
-              if (chunk.type === "progress") {
-                sendSSE({ type: "progress", data: chunk.data });
-              } else if (chunk.type === "partial") {
-                sendSSE({ type: "partial", data: chunk.data });
-              } else if (chunk.type === "heartbeat") {
-                sendSSE({ type: "heartbeat", data: chunk.data });
-              } else if (chunk.type === "complete") {
-                isComplete = true;
-                clearInterval(heartbeatInterval);
-
-                if (chunk.error) {
-                  sendSSE({ type: "error", error: chunk.error });
-                  res.end();
-                  return;
-                }
-
-                const ai = chunk.data as any;
-                if (Array.isArray(ai?.ops)) {
-                  const normalizedOps = ai.ops.map((o: any) =>
-                    o?.op === "add_field" ? { ...o, key: toCanonicalKey(o.key) } : o,
-                  );
-                  const applied = applyOpsInMemory(
-                    (existing as any).toObject ? (existing as any).toObject() : existing,
-                    normalizedOps,
-                  );
-                  const strict = normalizeErd(applied);
-                  nextNodes = strict.nodes;
-                  nextEdges = strict.edges;
-                } else {
-                  const strict = normalizeErd({ nodes: ai?.nodes ?? [], edges: ai?.edges ?? [] });
-                  nextNodes = strict.nodes;
-                  nextEdges = strict.edges;
-                }
-
-                assistantMessage =
-                  ai?.message ||
-                  buildAssistantSummary({
-                    nodes: nextNodes,
-                    edges: nextEdges,
-                    prompt: prompt.trim(),
-                  });
-
-                const finalChat = [
-                  ...workingChat,
-                  { role: "assistant", content: assistantMessage, ts: Date.now() },
-                ].slice(-100);
-
-                const doc = await DiagramModel.findOneAndUpdate(
-                  { _id: existing._id, version: baseVersion },
-                  {
-                    $set: {
-                      ...(title ? { title: title.trim() } : {}),
-                      ...(type ? { type } : {}),
-                      nodes: nextNodes,
-                      edges: nextEdges,
-                      prompt: prompt.trim(),
-                      model: chosenModel,
-                      chat: finalChat,
-                    },
-                    $inc: { version: 1 },
-                  },
-                  { new: true },
-                ).lean();
-
-                if (!doc) {
-                  sendSSE({ type: "error", error: "Version conflict" });
-                  res.end();
-                  return;
-                }
-
-                sendSSE({ type: "complete", data: doc });
-                res.end();
-                return;
-              }
-            }
-          } finally {
-            clearInterval(heartbeatInterval);
+          if (!result.success) {
+            sendSSE({ type: "error", error: result.error });
+            res.end();
+            return;
           }
-        } catch (err: any) {
-          console.error("[updateDiagramStream:AI] error:", err);
-          let errMsg = err?.message || "AI generation failed";
 
-          // Provide more helpful error messages for common issues
-          if (errMsg.includes("Invalid diagram JSON")) {
-            errMsg =
-              "The AI generated an invalid diagram structure. Please try again with a different prompt.";
-          } else if (errMsg.includes("Empty response")) {
-            errMsg = "The AI didn't generate any content. Please try again.";
-          } else if (errMsg.includes("timeout")) {
-            errMsg = "The AI request timed out. Please try again.";
-          } else if (errMsg.includes("quota") || errMsg.includes("429")) {
-            errMsg = "AI service quota exceeded. Please try again later.";
-          }
+          const { nodes: nextNodes, edges: nextEdges, message: assistantMessage } = result.data;
 
           const finalChat = [
             ...workingChat,
-            { role: "assistant", content: `There was an error: ${errMsg}`, ts: Date.now() },
-          ].slice(-100);
+            { role: "assistant" as ChatRole, content: assistantMessage, ts: Date.now() },
+          ].slice(-MAX_CHAT_HISTORY);
 
-          await DiagramModel.findOneAndUpdate(
-            { _id: existing._id, version: baseVersion },
+          const doc = await updateDiagramWithResults(existing, baseVersion, {
+            title,
+            type,
+            nodes: nextNodes,
+            edges: nextEdges,
+            prompt: prompt.trim(),
+            model: chosenModel,
+            chat: finalChat,
+          });
+
+          if (!doc) {
+            sendSSE({ type: "error", error: "Version conflict" });
+            res.end();
+            return;
+          }
+
+          sendSSE({ type: "complete", data: doc });
+          res.end();
+          return;
+        } catch (err: any) {
+          logError(err, { operation, userId, diagramId: id });
+          const errMsg = normalizeErrorMessage(err);
+
+          const finalChat = [
+            ...workingChat,
             {
-              $set: {
-                ...(title ? { title: title.trim() } : {}),
-                ...(type ? { type } : {}),
-                prompt: prompt.trim(),
-                model: chosenModel,
-                chat: finalChat,
-              },
-              $inc: { version: 1 },
+              role: "assistant" as ChatRole,
+              content: `There was an error: ${errMsg}`,
+              ts: Date.now(),
             },
-            { new: true },
-          )
-            .lean()
-            .catch(() => {});
+          ].slice(-MAX_CHAT_HISTORY);
+
+          // Update diagram with error message
+          await updateDiagramWithResults(existing, baseVersion, {
+            title,
+            type,
+            nodes: [],
+            edges: [],
+            prompt: prompt.trim(),
+            model: chosenModel,
+            chat: finalChat,
+          }).catch(() => {});
 
           sendSSE({ type: "error", error: errMsg });
           res.end();
@@ -733,157 +1378,114 @@ export async function updateDiagramStream(req: Request, res: Response) {
       } else {
         // Regular JSON response - collect all streaming data and return at once
         try {
-          let nextNodes: any[] = [];
-          let nextEdges: any[] = [];
-          let assistantMessage: string | undefined;
-          let hasError = false;
-          let errorMessage = "";
+          const result = await handleNonStreamingGeneration(
+            composed,
+            chosenModel as any,
+            existing,
+            prompt,
+          );
 
-          for await (const chunk of hedgedGenerateStream(composed, chosenModel)) {
-            if (chunk.type === "complete") {
-              if (chunk.error) {
-                hasError = true;
-                errorMessage = chunk.error;
-                break;
-              }
-
-              const ai = chunk.data as any;
-              if (Array.isArray(ai?.ops)) {
-                const normalizedOps = ai.ops.map((o: any) =>
-                  o?.op === "add_field" ? { ...o, key: toCanonicalKey(o.key) } : o,
-                );
-                const applied = applyOpsInMemory(
-                  (existing as any).toObject ? (existing as any).toObject() : existing,
-                  normalizedOps,
-                );
-                const strict = normalizeErd(applied);
-                nextNodes = strict.nodes;
-                nextEdges = strict.edges;
-              } else {
-                const strict = normalizeErd({ nodes: ai?.nodes ?? [], edges: ai?.edges ?? [] });
-                nextNodes = strict.nodes;
-                nextEdges = strict.edges;
-              }
-
-              assistantMessage =
-                ai?.message ||
-                buildAssistantSummary({
-                  nodes: nextNodes,
-                  edges: nextEdges,
-                  prompt: prompt.trim(),
-                });
-              break;
-            }
-          }
-
-          if (hasError) {
+          if (!result.success) {
             const finalChat = [
               ...workingChat,
-              { role: "assistant", content: `There was an error: ${errorMessage}`, ts: Date.now() },
-            ].slice(-100);
-
-            await DiagramModel.findOneAndUpdate(
-              { _id: existing._id, version: baseVersion },
               {
-                $set: {
-                  ...(title ? { title: title.trim() } : {}),
-                  ...(type ? { type } : {}),
-                  prompt: prompt.trim(),
-                  model: chosenModel,
-                  chat: finalChat,
-                },
-                $inc: { version: 1 },
+                role: "assistant" as ChatRole,
+                content: `There was an error: ${result.error}`,
+                ts: Date.now(),
               },
-              { new: true },
-            )
-              .lean()
-              .catch(() => {});
+            ].slice(-MAX_CHAT_HISTORY);
 
-            return res.status(502).json(fail(errorMessage, "AI_FAILED"));
+            await updateDiagramWithResults(existing, baseVersion, {
+              title,
+              type,
+              nodes: [],
+              edges: [],
+              prompt: prompt.trim(),
+              model: chosenModel,
+              chat: finalChat,
+            }).catch(() => {});
+
+            const statusCode =
+              result.error?.includes("429") || /quota/i.test(result.error || "") ? 429 : 502;
+            const errorCode =
+              result.error?.includes("429") || /quota/i.test(result.error || "")
+                ? "AI_QUOTA_EXCEEDED"
+                : "AI_FAILED";
+
+            return res.status(statusCode).json(fail(result.error!, errorCode));
           }
+
+          const { nodes: nextNodes, edges: nextEdges, message: assistantMessage } = result.data;
 
           const finalChat = [
             ...workingChat,
-            { role: "assistant", content: assistantMessage, ts: Date.now() },
-          ].slice(-100);
+            { role: "assistant" as ChatRole, content: assistantMessage, ts: Date.now() },
+          ].slice(-MAX_CHAT_HISTORY);
 
-          const doc = await DiagramModel.findOneAndUpdate(
-            { _id: existing._id, version: baseVersion },
-            {
-              $set: {
-                ...(title ? { title: title.trim() } : {}),
-                ...(type ? { type } : {}),
-                nodes: nextNodes,
-                edges: nextEdges,
-                prompt: prompt.trim(),
-                model: chosenModel,
-                chat: finalChat,
-              },
-              $inc: { version: 1 },
-            },
-            { new: true },
-          ).lean();
+          const doc = await updateDiagramWithResults(existing, baseVersion, {
+            title,
+            type,
+            nodes: nextNodes,
+            edges: nextEdges,
+            prompt: prompt.trim(),
+            model: chosenModel,
+            chat: finalChat,
+          });
 
-          if (!doc) return res.status(409).json(fail("Version conflict", "CONFLICT"));
+          if (!doc) {
+            return res.status(409).json(fail("Version conflict", "CONFLICT"));
+          }
+
+          logSuccess("Diagram updated successfully (non-streaming)", {
+            operation,
+            userId,
+            diagramId: id,
+          });
+
           return res.json(ok(doc));
         } catch (err: any) {
-          console.error("[updateDiagramStream:AI] error:", err);
-          let errMsg = err?.message || "AI generation failed";
-
-          // Provide more helpful error messages for common issues
-          if (errMsg.includes("Invalid diagram JSON")) {
-            errMsg =
-              "The AI generated an invalid diagram structure. Please try again with a different prompt.";
-          } else if (errMsg.includes("Empty response")) {
-            errMsg = "The AI didn't generate any content. Please try again.";
-          } else if (errMsg.includes("timeout")) {
-            errMsg = "The AI request timed out. Please try again.";
-          } else if (errMsg.includes("quota") || errMsg.includes("429")) {
-            errMsg = "AI service quota exceeded. Please try again later.";
-          }
+          logError(err, { operation, userId, diagramId: id });
+          const errMsg = normalizeErrorMessage(err);
 
           const finalChat = [
             ...workingChat,
-            { role: "assistant", content: `There was an error: ${errMsg}`, ts: Date.now() },
-          ].slice(-100);
-
-          await DiagramModel.findOneAndUpdate(
-            { _id: existing._id, version: baseVersion },
             {
-              $set: {
-                ...(title ? { title: title.trim() } : {}),
-                ...(type ? { type } : {}),
-                prompt: prompt.trim(),
-                model: chosenModel,
-                chat: finalChat,
-              },
-              $inc: { version: 1 },
+              role: "assistant" as ChatRole,
+              content: `There was an error: ${errMsg}`,
+              ts: Date.now(),
             },
-            { new: true },
-          )
-            .lean()
-            .catch(() => {});
+          ].slice(-MAX_CHAT_HISTORY);
 
-          if (errMsg.includes("429") || /quota/i.test(errMsg)) {
-            return res.status(429).json(fail(errMsg, "AI_QUOTA_EXCEEDED"));
-          }
-          if (err?.response?.status) {
-            return res.status(err.response.status).json(fail(errMsg, "AI_FAILED"));
-          }
-          return res.status(502).json(fail(errMsg, "AI_FAILED"));
+          await updateDiagramWithResults(existing, baseVersion, {
+            title,
+            type,
+            nodes: [],
+            edges: [],
+            prompt: prompt.trim(),
+            model: chosenModel,
+            chat: finalChat,
+          }).catch(() => {});
+
+          const statusCode = errMsg.includes("429") || /quota/i.test(errMsg) ? 429 : 502;
+          const errorCode =
+            errMsg.includes("429") || /quota/i.test(errMsg) ? "AI_QUOTA_EXCEEDED" : "AI_FAILED";
+
+          return res.status(statusCode).json(fail(errMsg, errorCode));
         }
       }
     }
 
-    // If no prompt, return existing diagram
-    if (prompt && prompt.trim()) {
-      // This case is handled above in the AI generation path
-    } else {
-      // For non-AI updates, return regular JSON response
+    // If no prompt provided, return existing diagram
+    if (!prompt || !prompt.trim()) {
+      logSuccess("Returning existing diagram (no prompt provided)", {
+        operation,
+        userId,
+        diagramId: id,
+      });
       return res.json(ok((existing as any).toObject ? (existing as any).toObject() : existing));
     }
   } catch (err) {
-    console.error("[updateDiagramStream] error:", err);
-    res.status(500).json(fail("Failed to update diagram", "SERVER_ERROR"));
+    logError(err, { operation, userId, diagramId: req.params.id });
+    return res.status(500).json(fail("Failed to update diagram", "SERVER_ERROR"));
   }
 }
