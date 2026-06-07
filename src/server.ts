@@ -63,13 +63,24 @@ export function createServer() {
   app.use(
     cors({
       origin(origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) {
-        if (!origin) return cb(null, true);
-        if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-        return cb(new Error(`CORS blocked for origin: ${origin}`));
+        // Allow if no origin (like mobile apps or curl) or if wildcard is present
+        if (!origin || ALLOWED_ORIGINS.includes("*")) {
+          return cb(null, true);
+        }
+
+        // Check if origin is in the allowed list
+        if (ALLOWED_ORIGINS.includes(origin)) {
+          return cb(null, true);
+        }
+
+        // Special case for subdomains or variations if needed
+        // For now, let's just log and block
+        console.log(`CORS check: origin=${origin}, allowed=${ALLOWED_ORIGINS}`);
+        return cb(null, false); // Return false instead of Error to avoid stack traces in logs
       },
       credentials: true,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type", "Authorization"],
+      allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
       optionsSuccessStatus: 204,
     }),
   );
