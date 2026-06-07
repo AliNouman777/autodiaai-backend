@@ -3,11 +3,13 @@ services:
     name: autodia-backend
     env: node
     plan: free
-    buildCommand: npm install && npm run build
+    buildCommand: npm install --include=dev && npm run build
     startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
+      - key: SKIP_INSTALL_DEPS
+        value: true # Optimization for some environments
       - key: MONGO_URI
         sync: false
       - key: GEMINI_API_KEY

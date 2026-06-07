@@ -57,12 +57,12 @@ export function createServer() {
   // CORS
   const ALLOWED_ORIGINS = (env.CORS_ORIGIN || "")
     .split(",")
-    .map((s) => s.trim())
+    .map((s: string) => s.trim())
     .filter(Boolean);
 
   app.use(
     cors({
-      origin(origin, cb) {
+      origin(origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) {
         if (!origin) return cb(null, true);
         if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
         return cb(new Error(`CORS blocked for origin: ${origin}`));
@@ -100,13 +100,13 @@ export function createServer() {
   app.use("/auth/google", oauthRouter);
 
   // Backward-compat alias
-  app.get("/api/auth/oauth/google", (req, res) => {
+  app.get("/api/auth/oauth/google", (req: express.Request, res: express.Response) => {
     const qs = req.url.includes("?") ? req.url.substring(req.url.indexOf("?")) : "";
     return res.redirect(302, `/auth/google/login${qs}`);
   });
 
   // 404
-  app.use((_req, res) =>
+  app.use((_req: express.Request, res: express.Response) =>
     res.status(404).json({ success: false, error: { code: 404, message: "Not Found" } }),
   );
 
