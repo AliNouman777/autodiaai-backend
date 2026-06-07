@@ -1,0 +1,52 @@
+name: Deploy to Elastic Beanstalk
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # 2️⃣ Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22'
+
+      # 3️⃣ Install dependencies
+      - name: Install dependencies
+        run: npm install
+
+      # 4️⃣ Build TypeScript app
+      - name: Build application
+        run: npm run build
+
+      # 5️⃣ Create Procfile for Elastic Beanstalk
+      - name: Create Procfile
+        run: |
+          echo "web: node dist/index.js" > Procfile
+
+      # 6️⃣ Create deployment zip
+      - name: Zip deployment package
+        run: |
+          zip -r deploy.zip dist package.json Procfile node_modules -x "*.git*" "*.github/*" "*.vscode/*" "*.env"
+
+      # 7️⃣ Deploy to Elastic Beanstalk
+      - name: Deploy to Elastic Beanstalk
+        uses: einaregilsson/beanstalk-deploy@v20
+        with:
+          aws_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          application_name: ${{ secrets.EB_APP_NAME }}
+          environment_name: ${{ secrets.EB_ENV_NAME }}
+          version_label: github-${{ github.sha }}
+          region: ${{ secrets.AWS_REGION }}
+          deployment_package: deploy.zip
+          wait_for_deployment: true
