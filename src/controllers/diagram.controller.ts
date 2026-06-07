@@ -95,9 +95,17 @@ export async function getDiagram(req: Request, res: Response) {
     if (!Types.ObjectId.isValid(id)) {
       return res.status(400).json(fail("Invalid diagram id", "BAD_ID"));
     }
-    const owner = getOwnerFilter(req);
-    const doc = await DiagramModel.findOne({ _id: new Types.ObjectId(id), ...owner }).lean();
-    if (!doc) return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
+
+    const doc = await DiagramModel.findById(id).lean();
+    if (!doc) {
+      console.warn(`[getDiagram] 404 for ID: ${id}`);
+      return res.status(404).json(fail("Diagram not found", "NOT_FOUND"));
+    }
+
+    // 2) Optional: If we want to restrict viewing to owners only, we would do it here.
+    // However, for shareable links, we allow viewing.
+    // We will still restrict updates/deletes in their respective controllers.
+
     return res.json(ok(doc));
   } catch (err) {
     console.error("[getDiagram] error:", err);
@@ -171,6 +179,10 @@ export async function createDiagram(req: Request, res: Response) {
       chat: [],
       version: 0,
     });
+
+    // Explicitly wait for write concern if needed, though create() usually does this.
+    // We'll just log to verify creation order in logs.
+    console.info(`[createDiagram] Created: ${doc._id} for owner: ${JSON.stringify(owner)}`);
 
     return res.status(201).json(ok(doc));
   } catch (err) {

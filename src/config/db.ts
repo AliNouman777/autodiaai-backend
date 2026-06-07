@@ -3,6 +3,9 @@ import logger from "../libs/logger";
 
 export async function connectDB(uri: string) {
   mongoose.set("strictQuery", true);
-  await mongoose.connect(uri);
-  logger.info("🗄️  MongoDB connected");
+  // Explicitly specify dbName to avoid defaulting to 'test' if not in URI
+  await mongoose.connect(uri, {
+    dbName: "autodia",
+  });
+  logger.info("🗄️  MongoDB connected to database: autodia");
 }
