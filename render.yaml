@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: autodia-backend
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGO_URI
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: COOKIE_SECRET
+        generateValue: true
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: REDIRECT_URL
+        value: https://www.autodia.tech/diagram
+      - key: FRONTEND_URL
+        value: https://www.autodia.tech
+      - key: GOOGLE_CALLBACK_URL
+        sync: false # Set this to https://your-app.onrender.com/auth/google/callback after creation
